@@ -10,12 +10,12 @@ import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
 
-private const val TAG           = "VlessVpnService"
-private const val CH_ID         = "vless_vpn"
-private const val NOTIF_ID      = 1
-private const val VPN_ADDR      = "10.233.233.1"   // TUN 接口地址
-private const val VPN_PREFIX    = 24
-private const val MTU           = 1500
+private const val TAG        = "VlessVpnService"
+private const val CH_ID      = "vless_vpn"
+private const val NOTIF_ID   = 1
+private const val VPN_ADDR   = "10.233.233.1"
+private const val VPN_PREFIX = 24
+private const val MTU        = 1500
 
 class VlessVpnService : VpnService() {
 
@@ -23,10 +23,10 @@ class VlessVpnService : VpnService() {
         const val ACTION_START = "com.musicses.vlessvpn.START"
         const val ACTION_STOP  = "com.musicses.vlessvpn.STOP"
 
-        const val BROADCAST     = "com.musicses.vlessvpn.STATUS"
-        const val EXTRA_STATUS  = "status"           // CONNECTED | DISCONNECTED | ERROR
-        const val EXTRA_IN      = "bytes_in"
-        const val EXTRA_OUT     = "bytes_out"
+        const val BROADCAST    = "com.musicses.vlessvpn.STATUS"
+        const val EXTRA_STATUS = "status"     // CONNECTED | DISCONNECTED | ERROR
+        const val EXTRA_IN     = "bytes_in"
+        const val EXTRA_OUT    = "bytes_out"
     }
 
     private var tun: ParcelFileDescriptor? = null
@@ -37,8 +37,14 @@ class VlessVpnService : VpnService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         return when (intent?.action) {
-            ACTION_STOP -> { stopVpn(); stopSelf(); START_NOT_STICKY }
-            ACTION_START -> { startVpn(); START_STICKY }
+            ACTION_STOP  -> { stopVpn(); stopSelf(); START_NOT_STICKY }
+            ACTION_START -> {
+                // ✅ 修复：startForeground 必须在主线程（onStartCommand）里调用
+                // Android 14+ 在子线程调用会抛 ForegroundServiceStartNotAllowedException
+                startForeground(NOTIF_ID, buildNotif("Connecting…"))
+                startVpnInBackground()
+                START_STICKY
+            }
             else -> START_STICKY
         }
     }
@@ -46,48 +52,47 @@ class VlessVpnService : VpnService() {
     override fun onDestroy() { stopVpn(); super.onDestroy() }
     override fun onRevoke()  { stopVpn(); super.onRevoke() }
 
-    // ── 启动 VPN ─────────────────────────────────────────────────────────────
+    // ── 启动 VPN（后台线程） ──────────────────────────────────────────────────
 
-    private fun startVpn() {
+    private fun startVpnInBackground() {
         if (running) return
         running = true
-        startForeground(NOTIF_ID, buildNotif("Connecting…"))
 
         Thread {
             try {
                 val cfg = VlessConfig.load(this)
 
-                // 1. 启动本地 SOCKS5 服务器
+                // 1. 先启动本地 SOCKS5 服务器
                 val server = LocalSocks5Server(cfg) { bytesIn, bytesOut ->
-                    sendBroadcast(Intent(BROADCAST)
-                        .putExtra(EXTRA_STATUS, "CONNECTED")
-                        .putExtra(EXTRA_IN, bytesIn)
-                        .putExtra(EXTRA_OUT, bytesOut))
+                    sendBroadcast(
+                        Intent(BROADCAST)
+                            .putExtra(EXTRA_STATUS, "CONNECTED")
+                            .putExtra(EXTRA_IN, bytesIn)
+                            .putExtra(EXTRA_OUT, bytesOut)
+                    )
                     updateNotif("↓ ${fmt(bytesIn)}  ↑ ${fmt(bytesOut)}")
                 }
                 socks5 = server
                 val socksPort = server.start()
 
                 // 2. 建立 TUN 接口
-                val builder = Builder()
+                val tunBuilder = Builder()
                     .setSession("VlessVPN")
                     .setMtu(MTU)
                     .addAddress(VPN_ADDR, VPN_PREFIX)
-                    .addRoute("0.0.0.0", 0)         // 全流量路由
+                    .addRoute("0.0.0.0", 0)          // 全流量路由
                     .addDnsServer(cfg.dns1)
                     .addDnsServer(cfg.dns2)
                     .addDisallowedApplication(packageName)  // 排除自身，避免路由环路
 
-                tun = builder.establish() ?: run {
-                    broadcast("ERROR"); return@Thread
+                tun = tunBuilder.establish() ?: run {
+                    broadcast("ERROR")
+                    return@Thread
                 }
 
-                Log.i(TAG, "VPN up. TUN=${VPN_ADDR}, SOCKS5=127.0.0.1:$socksPort")
+                Log.i(TAG, "VPN up. TUN=$VPN_ADDR, SOCKS5=127.0.0.1:$socksPort")
                 broadcast("CONNECTED")
                 updateNotif("Connected")
-
-                // TUN fd 保持打开即可；流量由 Android 系统经 iptables 路由到 socksPort
-                // 若需要完整 userspace TCP stack，可在此启动 tun2socks 进程
 
             } catch (e: Exception) {
                 Log.e(TAG, "startVpn error: ${e.message}")
