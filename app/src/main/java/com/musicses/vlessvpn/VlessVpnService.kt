@@ -37,7 +37,6 @@ class VlessVpnService : VpnService() {
         return when (intent?.action) {
             ACTION_STOP  -> { stopVpn(); stopSelf(); START_NOT_STICKY }
             ACTION_START -> {
-                // startForeground 必须在主线程 onStartCommand 里调用
                 startForeground(NOTIF_ID, buildNotif("Connecting…"))
                 startVpnInBackground()
                 START_STICKY
@@ -55,9 +54,10 @@ class VlessVpnService : VpnService() {
 
         Thread {
             try {
-                val cfg = VlessConfig.load(this)
+                // 使用 ConfigStore 加载当前激活的配置
+                val cfg = ConfigStore.loadActive(this)
+                Log.i(TAG, "Starting VPN with profile: ${cfg.name} -> ${cfg.server}:${cfg.port}")
 
-                // 建立 TUN 接口
                 val tunBuilder = Builder()
                     .setSession("VlessVPN")
                     .setMtu(MTU)
@@ -72,7 +72,6 @@ class VlessVpnService : VpnService() {
                 }
                 tun = tunPfd
 
-                // 启动 PacketTunnel：直接在 TUN fd 上读写 IP 包并转发
                 val pt = PacketTunnel(tunPfd.fileDescriptor, cfg) { bytesIn, bytesOut ->
                     sendBroadcast(
                         Intent(BROADCAST)
@@ -85,9 +84,9 @@ class VlessVpnService : VpnService() {
                 packetTunnel = pt
                 pt.start()
 
-                Log.i(TAG, "VPN up, TUN=$VPN_ADDR")
+                Log.i(TAG, "VPN up: ${cfg.name}")
                 broadcast("CONNECTED")
-                updateNotif("Connected")
+                updateNotif("${cfg.name} • Connected")
 
             } catch (e: Exception) {
                 Log.e(TAG, "startVpn error: ${e.message}")
