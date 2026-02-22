@@ -1,0 +1,194 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/bg_dark"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="20dp">
+
+        <!-- Header -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="VLESS VPN"
+            android:textSize="26sp"
+            android:textStyle="bold"
+            android:textColor="@color/accent"
+            android:gravity="center"
+            android:paddingTop="16dp"
+            android:paddingBottom="8dp"/>
+
+        <!-- Status Card -->
+        <androidx.cardview.widget.CardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginVertical="12dp"
+            app:cardBackgroundColor="@color/card_bg"
+            app:cardCornerRadius="12dp"
+            app:cardElevation="4dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:gravity="center"
+                android:padding="24dp">
+
+                <TextView
+                    android:id="@+id/tvStatus"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="○ Disconnected"
+                    android:textSize="18sp"
+                    android:textColor="@color/text_secondary"
+                    android:paddingBottom="8dp"/>
+
+                <TextView
+                    android:id="@+id/tvTraffic"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text=""
+                    android:textSize="13sp"
+                    android:textColor="@color/text_secondary"
+                    android:visibility="gone"/>
+
+                <Button
+                    android:id="@+id/btnToggle"
+                    android:layout_width="200dp"
+                    android:layout_height="56dp"
+                    android:layout_marginTop="16dp"
+                    android:text="Connect"
+                    android:textSize="16sp"
+                    android:backgroundTint="@color/accent"
+                    android:textColor="@android:color/white"/>
+
+            </LinearLayout>
+        </androidx.cardview.widget.CardView>
+
+        <!-- Config Card -->
+        <androidx.cardview.widget.CardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginVertical="4dp"
+            app:cardBackgroundColor="@color/card_bg"
+            app:cardCornerRadius="12dp"
+            app:cardElevation="4dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Server Configuration"
+                    android:textStyle="bold"
+                    android:textColor="@color/accent"
+                    android:textSize="14sp"
+                    android:paddingBottom="12dp"/>
+
+                <!-- Server -->
+                <TextView style="@style/Label" android:text="Server Host"/>
+                <EditText
+                    android:id="@+id/etServer"
+                    style="@style/InputField"
+                    android:hint="e.g. vs.musicses.vip"
+                    android:inputType="textUri"/>
+
+                <!-- Port -->
+                <TextView style="@style/Label" android:text="Port"/>
+                <EditText
+                    android:id="@+id/etPort"
+                    style="@style/InputField"
+                    android:hint="443"
+                    android:inputType="number"/>
+
+                <!-- UUID -->
+                <TextView style="@style/Label" android:text="UUID"/>
+                <EditText
+                    android:id="@+id/etUuid"
+                    style="@style/InputField"
+                    android:hint="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                    android:inputType="text"/>
+
+                <!-- Path -->
+                <TextView style="@style/Label" android:text="WebSocket Path"/>
+                <EditText
+                    android:id="@+id/etPath"
+                    style="@style/InputField"
+                    android:hint="/?ed=2560"
+                    android:inputType="text"/>
+
+                <!-- SNI -->
+                <TextView style="@style/Label" android:text="SNI (TLS Server Name)"/>
+                <EditText
+                    android:id="@+id/etSni"
+                    style="@style/InputField"
+                    android:hint="same as server host"
+                    android:inputType="textUri"/>
+
+                <!-- WS Host Header -->
+                <TextView style="@style/Label" android:text="Host Header"/>
+                <EditText
+                    android:id="@+id/etWsHost"
+                    style="@style/InputField"
+                    android:hint="same as server host"
+                    android:inputType="textUri"/>
+
+                <!-- TLS verify -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:paddingTop="8dp">
+
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="Verify TLS Certificate"
+                        android:textColor="@color/text_primary"
+                        android:textSize="14sp"/>
+
+                    <com.google.android.material.switchmaterial.SwitchMaterial
+                        android:id="@+id/switchTls"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:checked="false"/>
+                </LinearLayout>
+
+                <!-- Save Button -->
+                <Button
+                    android:id="@+id/btnSave"
+                    android:layout_width="match_parent"
+                    android:layout_height="48dp"
+                    android:layout_marginTop="16dp"
+                    android:text="Save Configuration"
+                    android:backgroundTint="@color/card_bg"
+                    android:textColor="@color/accent"
+                    style="@style/Widget.Material3.Button.OutlinedButton"/>
+
+            </LinearLayout>
+        </androidx.cardview.widget.CardView>
+
+        <!-- Footer note -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Routing all traffic via VLESS/WS tunnel"
+            android:textSize="11sp"
+            android:textColor="@color/text_secondary"
+            android:gravity="center"
+            android:paddingVertical="12dp"/>
+
+    </LinearLayout>
+</ScrollView>
