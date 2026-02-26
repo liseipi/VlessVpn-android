@@ -1,11 +1,14 @@
 package com.musicses.vlessvpn
 
+import android.net.VpnService  // ← 添加这个 import
 import android.util.Log
 import okhttp3.*
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import java.io.InputStream
 import java.io.OutputStream
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
 import java.util.concurrent.LinkedBlockingQueue
@@ -14,8 +17,10 @@ import javax.net.ssl.*
 
 private const val TAG = "VlessTunnel"
 
-class VlessTunnel(private val cfg: VlessConfig) {
-
+class VlessTunnel(
+    private val cfg: VlessConfig,
+    private val vpnService: VpnService? = null  // ← VpnService 引用用于 protect
+) {
     private var ws: WebSocket? = null
     private val inQueue = LinkedBlockingQueue<ByteArray?>()
     private var firstMsg = true
@@ -42,8 +47,9 @@ class VlessTunnel(private val cfg: VlessConfig) {
 
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 ws = webSocket
+                Log.i(TAG, "✓ WebSocket opened to ${cfg.server}:${cfg.port}")
+
                 val header = VlessProtocol.buildHeader(cfg.uuid, destHost, destPort)
-                // ✅ 修复：ByteArray? 没有 isNullOrEmpty()，改用显式判断
                 val firstPkt = if (earlyData != null && earlyData.isNotEmpty())
                     header + earlyData else header
                 webSocket.send(firstPkt.toByteString())
@@ -59,15 +65,17 @@ class VlessTunnel(private val cfg: VlessConfig) {
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                inQueue.put(null); webSocket.close(1000, null)
+                inQueue.put(null)
+                webSocket.close(1000, null)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                Log.d(TAG, "WebSocket closed: $code $reason")
                 inQueue.put(null)
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                Log.e(TAG, "WS failure: ${t.message}")
+                Log.e(TAG, "✗ WebSocket failure: ${t.message}")
                 inQueue.put(null)
                 if (!resultSent) { resultSent = true; onResult(false) }
             }
@@ -125,6 +133,49 @@ class VlessTunnel(private val cfg: VlessConfig) {
             .readTimeout(0,  TimeUnit.SECONDS)
             .writeTimeout(10, TimeUnit.SECONDS)
 
+        // ★★★ 关键：添加自定义 SocketFactory 来 protect 所有 socket ★★★
+        if (vpnService != null) {
+            builder.socketFactory(object : javax.net.SocketFactory() {
+                private val defaultFactory = javax.net.SocketFactory.getDefault()
+
+                override fun createSocket(): Socket {
+                    val socket = defaultFactory.createSocket()
+                    if (vpnService.protect(socket)) {
+                        Log.d(TAG, "✓ Socket protected from VPN routing")
+                    } else {
+                        Log.w(TAG, "⚠ Failed to protect socket")
+                    }
+                    return socket
+                }
+
+                override fun createSocket(host: String, port: Int): Socket {
+                    val socket = createSocket()
+                    socket.connect(InetSocketAddress(host, port))
+                    return socket
+                }
+
+                override fun createSocket(host: String, port: Int, localHost: java.net.InetAddress, localPort: Int): Socket {
+                    val socket = createSocket()
+                    socket.bind(InetSocketAddress(localHost, localPort))
+                    socket.connect(InetSocketAddress(host, port))
+                    return socket
+                }
+
+                override fun createSocket(host: java.net.InetAddress, port: Int): Socket {
+                    val socket = createSocket()
+                    socket.connect(InetSocketAddress(host, port))
+                    return socket
+                }
+
+                override fun createSocket(address: java.net.InetAddress, port: Int, localAddress: java.net.InetAddress, localPort: Int): Socket {
+                    val socket = createSocket()
+                    socket.bind(InetSocketAddress(localAddress, localPort))
+                    socket.connect(InetSocketAddress(address, port))
+                    return socket
+                }
+            })
+        }
+
         if (!cfg.rejectUnauthorized) {
             val trustAll = object : X509TrustManager {
                 override fun checkClientTrusted(c: Array<X509Certificate>, a: String) {}
@@ -134,7 +185,50 @@ class VlessTunnel(private val cfg: VlessConfig) {
             val sc = SSLContext.getInstance("TLS").also {
                 it.init(null, arrayOf(trustAll), SecureRandom())
             }
-            builder.sslSocketFactory(sc.socketFactory, trustAll)
+
+            val sslSocketFactory = sc.socketFactory
+
+            // ★ 如果有 vpnService，包装 SSLSocketFactory 来 protect SSL sockets
+            if (vpnService != null) {
+                builder.sslSocketFactory(object : SSLSocketFactory() {
+                    override fun getDefaultCipherSuites() = sslSocketFactory.defaultCipherSuites
+                    override fun getSupportedCipherSuites() = sslSocketFactory.supportedCipherSuites
+
+                    override fun createSocket(s: Socket, host: String, port: Int, autoClose: Boolean): Socket {
+                        if (vpnService.protect(s)) {
+                            Log.d(TAG, "✓ SSL socket protected")
+                        }
+                        return sslSocketFactory.createSocket(s, host, port, autoClose)
+                    }
+
+                    override fun createSocket(host: String, port: Int): Socket {
+                        val socket = sslSocketFactory.createSocket(host, port)
+                        vpnService.protect(socket)
+                        return socket
+                    }
+
+                    override fun createSocket(host: String, port: Int, localHost: java.net.InetAddress, localPort: Int): Socket {
+                        val socket = sslSocketFactory.createSocket(host, port, localHost, localPort)
+                        vpnService.protect(socket)
+                        return socket
+                    }
+
+                    override fun createSocket(host: java.net.InetAddress, port: Int): Socket {
+                        val socket = sslSocketFactory.createSocket(host, port)
+                        vpnService.protect(socket)
+                        return socket
+                    }
+
+                    override fun createSocket(address: java.net.InetAddress, port: Int, localAddress: java.net.InetAddress, localPort: Int): Socket {
+                        val socket = sslSocketFactory.createSocket(address, port, localAddress, localPort)
+                        vpnService.protect(socket)
+                        return socket
+                    }
+                }, trustAll)
+            } else {
+                builder.sslSocketFactory(sslSocketFactory, trustAll)
+            }
+
             builder.hostnameVerifier { _, _ -> true }
         }
 
