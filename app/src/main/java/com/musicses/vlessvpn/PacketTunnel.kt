@@ -27,7 +27,7 @@ private const val MTU = 1500
 class PacketTunnel(
     private val fd: FileDescriptor,
     private val cfg: VlessConfig,
-    private val vpnService: VpnService? = null,  // ← 添加 VpnService 用于 protect
+    private val vpnService: VpnService? = null,
     private val onStats: (bytesIn: Long, bytesOut: Long) -> Unit
 ) {
     private val executor   = Executors.newCachedThreadPool()
@@ -61,16 +61,16 @@ class PacketTunnel(
         while (running) {
             try {
                 val n = tunIn.read(buf)
-                if (n < 20) continue                        // 太短，不是合法 IP 包
+                if (n < 20) continue
 
                 val pkt = buf.copyOf(n)
                 val bb  = ByteBuffer.wrap(pkt)
 
                 val version = (bb.get(0).toInt() and 0xFF) ushr 4
-                if (version != 4) continue                  // 只处理 IPv4
+                if (version != 4) continue
 
                 val protocol = bb.get(9).toInt() and 0xFF
-                if (protocol != 6) continue                 // 只处理 TCP（6）
+                if (protocol != 6) continue
 
                 handleTcpPacket(pkt, bb)
             } catch (e: Exception) {
@@ -82,19 +82,15 @@ class PacketTunnel(
     // ── TCP 包处理 ───────────────────────────────────────────────────────────
 
     private fun handleTcpPacket(pkt: ByteArray, bb: ByteBuffer) {
-        // IPv4 头长度
         val ihl = (bb.get(0).toInt() and 0x0F) * 4
         if (pkt.size < ihl + 20) return
 
-        // 解析源/目标 IP
         val srcIp  = formatIp(pkt, 12)
         val dstIp  = formatIp(pkt, 16)
 
-        // 解析源/目标端口
         val srcPort = ((pkt[ihl].toInt() and 0xFF) shl 8) or (pkt[ihl + 1].toInt() and 0xFF)
         val dstPort = ((pkt[ihl + 2].toInt() and 0xFF) shl 8) or (pkt[ihl + 3].toInt() and 0xFF)
 
-        // TCP flags
         val flags = pkt[ihl + 13].toInt() and 0xFF
         val isSyn = (flags and 0x02) != 0
         val isFin = (flags and 0x01) != 0
@@ -104,7 +100,6 @@ class PacketTunnel(
 
         val flowKey = "$srcIp:$srcPort->$dstIp:$dstPort"
 
-        // TCP 数据偏移
         val dataOffset = ((pkt[ihl + 12].toInt() and 0xFF) ushr 4) * 4
         val payloadStart = ihl + dataOffset
         val payload = if (pkt.size > payloadStart) pkt.copyOfRange(payloadStart, pkt.size)
@@ -112,12 +107,11 @@ class PacketTunnel(
 
         when {
             isSyn && !isAck -> {
-                // 新连接 SYN
                 Log.d(TAG, "SYN: $flowKey")
                 val flow = TcpFlow(
                     srcIp, srcPort, dstIp, dstPort,
                     seqFromPkt(pkt, ihl),
-                    cfg, vpnService, tunOut  // ← 传递 vpnService
+                    cfg, vpnService, tunOut
                 ) { bytesIn, bytesOut ->
                     totalIn  += bytesIn
                     totalOut += bytesOut
@@ -127,6 +121,7 @@ class PacketTunnel(
                 flow.handleSyn()
             }
             isFin || isRst -> {
+                Log.d(TAG, "${if (isFin) "FIN" else "RST"}: $flowKey")
                 flows.remove(flowKey)?.close()
             }
             payload.isNotEmpty() -> {
@@ -154,64 +149,104 @@ private class TcpFlow(
     private val srcPort: Int,
     private val dstIp:   String,
     private val dstPort: Int,
-    private val clientSeq: Long,         // 客户端初始序号
+    private val clientSeq: Long,
     private val cfg: VlessConfig,
-    private val vpnService: VpnService?,  // ← 添加 VpnService
+    private val vpnService: VpnService?,
     private val tunOut: FileOutputStream,
     private val onStats: (Long, Long) -> Unit
 ) {
-    private val tunnel  = VlessTunnel(cfg, vpnService)  // ← 传递 vpnService
+    private val tunnel  = VlessTunnel(cfg, vpnService)
     private val pipe    = java.io.PipedOutputStream()
     private val pipeIn  = java.io.PipedInputStream(pipe, 65536)
 
-    // 我们伪造的服务端序号
     private var serverSeq = System.currentTimeMillis() and 0xFFFFFFFFL
-    private var clientAck = clientSeq + 1   // 期待客户端下一个字节
+    private var clientAck = clientSeq + 1
 
     @Volatile private var closed = false
+    @Volatile private var connected = false  // ← 添加连接状态标记
 
     fun handleSyn() {
-        // 1. 回一个 SYN-ACK 给本地 TCP 栈
         writeSynAck()
 
-        // 2. 开 VLESS 隧道，把 pipeIn 作为发给服务器的数据源
+        // ★ 关键修复：在隧道建立后再启动 relay
         tunnel.connect(dstIp, dstPort) { ok ->
-            if (!ok) { close(); return@connect }
-            // relay：从 pipeIn 读数据发给服务器，服务器返回的数据写回 TUN
+            if (!ok) {
+                Log.e(TAG, "[$srcIp:$srcPort→$dstIp:$dstPort] Tunnel connection failed")
+                close()
+                return@connect
+            }
+
+            connected = true
+            Log.d(TAG, "[$srcIp:$srcPort→$dstIp:$dstPort] Tunnel connected, starting relay")
+
+            // 启动中继线程
             Thread {
                 try {
-                    tunnel.relay(pipeIn, TunOutputStream(srcIp, srcPort, dstIp, dstPort,
-                        serverSeq, clientAck, tunOut, onStats))
+                    val tunOutputStream = TunOutputStream(
+                        srcIp   = dstIp,
+                        srcPort = dstPort,
+                        dstIp   = srcIp,
+                        dstPort = srcPort,
+                        seq     = serverSeq,
+                        ack     = clientAck,
+                        tunOut  = tunOut,
+                        onStats = onStats
+                    )
+
+                    // ★ 这里是关键：relay 会阻塞直到连接结束
+                    tunnel.relay(pipeIn, tunOutputStream)
+
+                    Log.d(TAG, "[$srcIp:$srcPort→$dstIp:$dstPort] Relay completed")
                 } catch (e: Exception) {
-                    Log.d(TAG, "flow relay ended: ${e.message}")
+                    Log.e(TAG, "[$srcIp:$srcPort→$dstIp:$dstPort] Relay error: ${e.message}")
                 } finally {
                     close()
                 }
-            }.also { it.isDaemon = true }.start()
+            }.apply {
+                name = "TcpFlow-$srcPort→$dstPort"
+                isDaemon = true
+            }.start()
         }
     }
 
-    /** 客户端发来的 TCP 数据 → 写入 pipe → tunnel.relay 读走 → 发到服务器 */
     fun send(data: ByteArray) {
-        if (closed) return
-        try { pipe.write(data); pipe.flush() } catch (_: Exception) { close() }
+        if (closed || !connected) {
+            // 如果还没连接，等待一下
+            if (!connected) {
+                Thread.sleep(50)
+                if (!connected) {
+                    Log.w(TAG, "[$srcIp:$srcPort→$dstIp:$dstPort] Dropping ${data.size}B (not connected)")
+                    return
+                }
+            } else {
+                return
+            }
+        }
+
+        try {
+            pipe.write(data)
+            pipe.flush()
+        } catch (e: Exception) {
+            Log.d(TAG, "[$srcIp:$srcPort→$dstIp:$dstPort] Send error: ${e.message}")
+            close()
+        }
     }
 
     fun close() {
         if (closed) return
         closed = true
+        Log.d(TAG, "[$srcIp:$srcPort→$dstIp:$dstPort] Closing flow")
         runCatching { pipe.close() }
         tunnel.close()
     }
 
     private fun writeSynAck() {
-        // 构造 SYN-ACK: TCP flags=0x12(SYN+ACK)
         val pkt = buildTcpPacket(
             srcIp   = dstIp,   srcPort = dstPort,
             dstIp   = srcIp,   dstPort = srcPort,
             seq     = serverSeq,
             ack     = clientSeq + 1,
-            flags   = 0x12,    // SYN + ACK
+            flags   = 0x12,
             payload = ByteArray(0)
         )
         serverSeq++
@@ -222,9 +257,9 @@ private class TcpFlow(
 // ── 把服务器响应数据包装成 TCP 包写回 TUN ─────────────────────────────────────
 
 private class TunOutputStream(
-    private val srcIp:   String,    // 数据包的"源"（实际是远端服务器）
+    private val srcIp:   String,
     private val srcPort: Int,
-    private val dstIp:   String,    // 数据包的"目标"（实际是本地 App）
+    private val dstIp:   String,
     private val dstPort: Int,
     private var seq:     Long,
     private val ack:     Long,
@@ -233,10 +268,13 @@ private class TunOutputStream(
 ) : OutputStream() {
 
     private var totalIn = 0L
+    private val TAG = "TunOutputStream"
 
     override fun write(b: Int) = write(byteArrayOf(b.toByte()))
 
     override fun write(buf: ByteArray, off: Int, len: Int) {
+        if (len == 0) return
+
         val data = buf.copyOfRange(off, off + len)
         val pkt  = buildTcpPacket(
             srcIp   = srcIp,   srcPort = srcPort,
@@ -249,7 +287,13 @@ private class TunOutputStream(
         seq += data.size
         totalIn += data.size
         onStats(totalIn, 0L)
-        runCatching { tunOut.write(pkt) }
+
+        try {
+            tunOut.write(pkt)
+        } catch (e: Exception) {
+            Log.e(TAG, "[$srcIp:$srcPort→$dstIp:$dstPort] Write error: ${e.message}")
+            throw e
+        }
     }
 
     override fun write(b: ByteArray) = write(b, 0, b.size)
@@ -274,18 +318,17 @@ private fun buildTcpPacket(
     val dstIpBytes = ipToBytes(dstIp)
 
     // ── IPv4 头 ───────────────────────────────────────────────────────────────
-    buf.put(0x45.toByte())                          // Version=4, IHL=5
-    buf.put(0x00)                                    // DSCP/ECN
-    buf.putShort(totalLen.toShort())                 // Total length
-    buf.putShort(0)                                  // ID
-    buf.putShort(0x4000.toShort())                   // Flags: Don't fragment
-    buf.put(64)                                      // TTL
-    buf.put(6)                                       // Protocol: TCP
-    buf.putShort(0)                                  // Checksum placeholder
+    buf.put(0x45.toByte())
+    buf.put(0x00)
+    buf.putShort(totalLen.toShort())
+    buf.putShort(0)
+    buf.putShort(0x4000.toShort())
+    buf.put(64)
+    buf.put(6)
+    buf.putShort(0)
     buf.put(srcIpBytes)
     buf.put(dstIpBytes)
 
-    // IP checksum
     val ipChecksum = checksum(buf.array(), 0, ipHdrLen)
     buf.putShort(10, ipChecksum.toShort())
 
@@ -294,16 +337,14 @@ private fun buildTcpPacket(
     buf.putShort(dstPort.toShort())
     buf.putInt((seq and 0xFFFFFFFFL).toInt())
     buf.putInt((ack and 0xFFFFFFFFL).toInt())
-    buf.put((5 shl 4).toByte())                      // Data offset = 5 * 4 = 20
+    buf.put((5 shl 4).toByte())
     buf.put(flags.toByte())
-    buf.putShort(65535.toShort())                    // Window size
-    buf.putShort(0)                                  // TCP checksum placeholder
-    buf.putShort(0)                                  // Urgent pointer
+    buf.putShort(65535.toShort())
+    buf.putShort(0)
+    buf.putShort(0)
 
-    // Payload
     if (payload.isNotEmpty()) buf.put(payload)
 
-    // TCP checksum（伪头 + TCP段）
     val tcpChecksum = tcpChecksum(srcIpBytes, dstIpBytes, buf.array(), ipHdrLen, tcpHdrLen + payload.size)
     buf.putShort(ipHdrLen + 16, tcpChecksum.toShort())
 
@@ -326,7 +367,6 @@ private fun checksum(buf: ByteArray, offset: Int, length: Int): Int {
 }
 
 private fun tcpChecksum(srcIp: ByteArray, dstIp: ByteArray, buf: ByteArray, tcpOffset: Int, tcpLength: Int): Int {
-    // 伪头：srcIp(4) + dstIp(4) + 0x00 + protocol(6) + tcp_length(2)
     val pseudo = ByteArray(12 + tcpLength)
     srcIp.copyInto(pseudo, 0)
     dstIp.copyInto(pseudo, 4)

@@ -20,9 +20,10 @@ private const val TAG = "VlessTunnel"
 /**
  * VLESS over WebSocket 隧道
  *
- * ★ 关键修复：不在 WebSocket open 时立即发送 VLESS 头
- * 而是等到有实际数据时，把 VLESS头 + 第一批数据 合并发送
- * 这样避免服务器因为只收到协议头而关闭连接
+ * ★ 关键修复：
+ * 1. 使用独立的状态标记避免竞态条件
+ * 2. 在 relay() 中处理响应头（不在 onMessage 中）
+ * 3. 增加详细的写入日志
  */
 class VlessTunnel(
     private val cfg: VlessConfig,
@@ -30,13 +31,12 @@ class VlessTunnel(
 ) {
     private var ws: WebSocket? = null
     private val inQueue = LinkedBlockingQueue<ByteArray>(1000)
-    private var firstMsg = true
     @Volatile private var closed = false
-    @Volatile private var headerSent = false  // ← 标记是否已发送协议头
+    @Volatile private var headerSent = false
 
     private val END_MARKER = ByteArray(0)
 
-    // 保存连接参数，用于延迟发送协议头
+    // 保存连接参数
     private var destHost: String = ""
     private var destPort: Int = 0
 
@@ -52,7 +52,6 @@ class VlessTunnel(
             return
         }
 
-        // 保存目标信息
         this.destHost = destHost
         this.destPort = destPort
 
@@ -80,8 +79,6 @@ class VlessTunnel(
                 Log.i(TAG, "✓ WebSocket opened to ${cfg.server}:${cfg.port}")
                 Log.d(TAG, "Target: $destHost:$destPort")
 
-                // ★★★ 关键修复：如果有 early data，立即发送协议头 + 数据
-                // 否则等到 relay 开始时再发送
                 if (earlyData != null && earlyData.isNotEmpty()) {
                     Log.d(TAG, "Sending VLESS header + early data (${earlyData.size} bytes)")
                     sendVlessHeader(earlyData)
@@ -97,15 +94,14 @@ class VlessTunnel(
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
                 if (!closed && bytes.size > 0) {
-                    Log.d(TAG, "← Received ${bytes.size} bytes")
+                    val data = bytes.toByteArray()
 
-                    if (firstMsg) {
-                        Log.d(TAG, "First message from server")
-                        firstMsg = false
-                    }
+                    // ★ 只记录日志，不修改 firstResponseProcessed
+                    // 响应头处理在 relay() 方法中进行
+                    Log.d(TAG, "← Received ${data.size} bytes from server")
 
-                    if (!inQueue.offer(bytes.toByteArray(), 100, TimeUnit.MILLISECONDS)) {
-                        Log.w(TAG, "Queue full, dropping message")
+                    if (!inQueue.offer(data, 100, TimeUnit.MILLISECONDS)) {
+                        Log.w(TAG, "Queue full, dropping ${data.size} bytes")
                     }
                 }
             }
@@ -114,6 +110,7 @@ class VlessTunnel(
                 if (!closed) {
                     val bytes = text.toByteArray(Charsets.UTF_8)
                     if (bytes.isNotEmpty()) {
+                        Log.d(TAG, "← Received text message (${bytes.size} bytes)")
                         if (!inQueue.offer(bytes, 100, TimeUnit.MILLISECONDS)) {
                             Log.w(TAG, "Queue full, dropping text")
                         }
@@ -133,8 +130,10 @@ class VlessTunnel(
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                Log.e(TAG, "✗ WebSocket failure: ${t.message}", t)
-                Log.e(TAG, "  Response: ${response?.code} ${response?.message}")
+                Log.e(TAG, "✗ WebSocket failure: ${t.javaClass.simpleName}: ${t.message}")
+                if (response != null) {
+                    Log.e(TAG, "  Response: ${response.code} ${response.message}")
+                }
                 inQueue.offer(END_MARKER)
 
                 if (!resultSent) {
@@ -145,10 +144,6 @@ class VlessTunnel(
         })
     }
 
-    /**
-     * 发送 VLESS 协议头 + 数据
-     * data 可以为空，但建议总是包含一些数据
-     */
     private fun sendVlessHeader(data: ByteArray? = null) {
         if (headerSent) {
             Log.w(TAG, "Header already sent")
@@ -163,7 +158,7 @@ class VlessTunnel(
             Log.d(TAG, "Sending header (${header.size}B) + data (${data.size}B)")
             header + data
         } else {
-            Log.d(TAG, "Sending header only (${header.size}B) - may cause server to close!")
+            Log.d(TAG, "Sending header only (${header.size}B)")
             header
         }
 
@@ -176,35 +171,74 @@ class VlessTunnel(
             return
         }
 
+        // ★ 在 relay 中处理响应头，避免竞态条件
+        var firstResponseProcessed = false
+
         // ★ 从服务器接收数据 → 写入本地
         val t1 = Thread {
             try {
                 while (!closed) {
                     val chunk = inQueue.poll(30, TimeUnit.SECONDS)
-                    if (chunk == null || chunk === END_MARKER) {
-                        Log.d(TAG, "WS→local: ${if (chunk == null) "timeout" else "closed"}")
+                    if (chunk == null) {
+                        Log.w(TAG, "WS→local: timeout (30s), closing")
+                        break
+                    }
+                    if (chunk === END_MARKER) {
+                        Log.d(TAG, "WS→local: received END_MARKER")
                         break
                     }
 
-                    // 第一条消息需要跳过 VLESS 响应头（2字节）
-                    val payload = if (firstMsg && chunk.size > 2) {
-                        firstMsg = false
-                        Log.d(TAG, "Stripping VLESS response header (2 bytes)")
-                        chunk.copyOfRange(2, chunk.size)
+                    // ★ 关键修复：在这里处理响应头
+                    val payload = if (!firstResponseProcessed && chunk.size >= 2) {
+                        firstResponseProcessed = true
+
+                        val version = chunk[0].toInt() and 0xFF
+                        val addonLen = chunk[1].toInt() and 0xFF
+                        val headerLen = 2 + addonLen
+
+                        Log.d(TAG, "✓ Processing VLESS response header:")
+                        Log.d(TAG, "   Version: 0x${"%02x".format(version)}")
+                        Log.d(TAG, "   Addon length: $addonLen")
+                        Log.d(TAG, "   Header length: $headerLen bytes")
+                        Log.d(TAG, "   Total chunk: ${chunk.size} bytes")
+
+                        if (version != 0) {
+                            Log.w(TAG, "   ⚠ Unexpected version: $version")
+                        }
+
+                        if (chunk.size > headerLen) {
+                            val payloadSize = chunk.size - headerLen
+                            Log.d(TAG, "   → Extracting payload: $payloadSize bytes")
+                            chunk.copyOfRange(headerLen, chunk.size)
+                        } else {
+                            Log.w(TAG, "   ⚠ No payload after header")
+                            ByteArray(0)
+                        }
                     } else {
+                        // 后续数据包直接使用
                         chunk
                     }
 
                     if (payload.isNotEmpty()) {
-                        localOut.write(payload)
-                        localOut.flush()
+                        try {
+                            Log.d(TAG, "→ Writing ${payload.size} bytes to local")
+                            localOut.write(payload)
+                            localOut.flush()
+                            Log.d(TAG, "✓ Successfully wrote ${payload.size} bytes")
+                        } catch (e: Exception) {
+                            Log.e(TAG, "✗ Write to local failed: ${e.javaClass.simpleName}: ${e.message}")
+                            throw e
+                        }
+                    } else {
+                        Log.d(TAG, "⊘ Skipping empty payload")
                     }
                 }
             } catch (e: Exception) {
                 if (!closed) {
-                    Log.d(TAG, "WS→local error: ${e.message}")
+                    Log.e(TAG, "WS→local error: ${e.javaClass.simpleName}: ${e.message}")
                 }
             } finally {
+                Log.d(TAG, "WS→local thread ending")
                 runCatching { localOut.close() }
                 ws?.cancel()
             }
@@ -214,32 +248,42 @@ class VlessTunnel(
         val t2 = Thread {
             try {
                 val buf = ByteArray(8192)
+                var totalSent = 0
+
                 while (!closed) {
                     val n = localIn.read(buf)
-                    if (n < 0) break
+                    if (n < 0) {
+                        Log.d(TAG, "local→WS: EOF reached")
+                        break
+                    }
 
                     val data = buf.copyOf(n)
 
-                    // ★★★ 如果协议头还没发送，现在发送（header + 第一批数据）
                     if (!headerSent) {
                         Log.d(TAG, "First data from local (${data.size}B), sending with header")
                         sendVlessHeader(data)
                     } else {
-                        // 后续数据直接发送
                         ws?.send(data.toByteString())
                     }
+
+                    totalSent += n
+                    if (totalSent % 10240 == 0) {
+                        Log.d(TAG, "local→WS: sent ${totalSent / 1024}KB")
+                    }
                 }
+
+                Log.d(TAG, "local→WS: finished (total: ${totalSent / 1024}KB)")
             } catch (e: Exception) {
                 if (!closed) {
-                    Log.d(TAG, "local→WS error: ${e.message}")
+                    Log.e(TAG, "local→WS error: ${e.javaClass.simpleName}: ${e.message}")
                 }
             } finally {
-                // 如果到这里协议头还没发送（本地没有发数据），必须发一次
                 if (!headerSent) {
                     Log.w(TAG, "No data sent, sending header only")
                     sendVlessHeader()
                 }
 
+                Log.d(TAG, "local→WS thread ending")
                 inQueue.offer(END_MARKER)
                 ws?.close(1000, null)
             }
@@ -249,8 +293,13 @@ class VlessTunnel(
         t2.isDaemon = true
         t1.start()
         t2.start()
+
+        Log.d(TAG, "Relay threads started")
+
         t1.join()
         t2.join()
+
+        Log.d(TAG, "Relay threads completed")
     }
 
     fun close() {
@@ -265,9 +314,9 @@ class VlessTunnel(
     private fun buildClient(): OkHttpClient {
         val builder = OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)
-            .readTimeout(60, TimeUnit.SECONDS)
+            .readTimeout(0, TimeUnit.SECONDS)
             .writeTimeout(15, TimeUnit.SECONDS)
-            .pingInterval(30, TimeUnit.SECONDS)
+            .pingInterval(20, TimeUnit.SECONDS)
 
         // Socket protect
         if (vpnService != null) {
