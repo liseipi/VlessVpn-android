@@ -20,10 +20,7 @@ private const val TAG = "VlessTunnel"
 /**
  * VLESS over WebSocket 隧道
  *
- * ★ 关键修复：
- * 1. 使用独立的状态标记避免竞态条件
- * 2. 在 relay() 中处理响应头（不在 onMessage 中）
- * 3. 增加详细的写入日志
+ * ★ 增强版：增加详细的服务器响应分析和错误诊断
  */
 class VlessTunnel(
     private val cfg: VlessConfig,
@@ -34,9 +31,13 @@ class VlessTunnel(
     @Volatile private var closed = false
     @Volatile private var headerSent = false
 
+    // ★ 诊断信息
+    private var totalBytesReceived = 0
+    private var closeCode = -1
+    private var closeReason = ""
+
     private val END_MARKER = ByteArray(0)
 
-    // 保存连接参数
     private var destHost: String = ""
     private var destPort: Int = 0
 
@@ -65,6 +66,10 @@ class VlessTunnel(
             .header("Pragma",        "no-cache")
             .build()
 
+        Log.d(TAG, "Connecting to ${cfg.wsUrl}")
+        Log.d(TAG, "  Host header: ${cfg.wsHost}")
+        Log.d(TAG, "  Target: $destHost:$destPort")
+
         var resultSent = false
 
         client.newWebSocket(req, object : WebSocketListener() {
@@ -77,7 +82,9 @@ class VlessTunnel(
 
                 ws = webSocket
                 Log.i(TAG, "✓ WebSocket opened to ${cfg.server}:${cfg.port}")
-                Log.d(TAG, "Target: $destHost:$destPort")
+                Log.d(TAG, "  Protocol: ${response.protocol}")
+                Log.d(TAG, "  TLS version: ${response.handshake?.tlsVersion}")
+                Log.d(TAG, "  Target: $destHost:$destPort")
 
                 if (earlyData != null && earlyData.isNotEmpty()) {
                     Log.d(TAG, "Sending VLESS header + early data (${earlyData.size} bytes)")
@@ -95,10 +102,14 @@ class VlessTunnel(
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
                 if (!closed && bytes.size > 0) {
                     val data = bytes.toByteArray()
+                    totalBytesReceived += data.size
 
-                    // ★ 只记录日志，不修改 firstResponseProcessed
-                    // 响应头处理在 relay() 方法中进行
-                    Log.d(TAG, "← Received ${data.size} bytes from server")
+                    Log.d(TAG, "← Received ${data.size} bytes from server (total: $totalBytesReceived)")
+
+                    // ★ 分析第一个响应包
+                    if (totalBytesReceived == data.size) {
+                        analyzeFirstResponse(data)
+                    }
 
                     if (!inQueue.offer(data, 100, TimeUnit.MILLISECONDS)) {
                         Log.w(TAG, "Queue full, dropping ${data.size} bytes")
@@ -110,6 +121,7 @@ class VlessTunnel(
                 if (!closed) {
                     val bytes = text.toByteArray(Charsets.UTF_8)
                     if (bytes.isNotEmpty()) {
+                        totalBytesReceived += bytes.size
                         Log.d(TAG, "← Received text message (${bytes.size} bytes)")
                         if (!inQueue.offer(bytes, 100, TimeUnit.MILLISECONDS)) {
                             Log.w(TAG, "Queue full, dropping text")
@@ -119,13 +131,29 @@ class VlessTunnel(
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                Log.d(TAG, "WebSocket closing: $code $reason")
+                closeCode = code
+                closeReason = reason
+                Log.w(TAG, "⚠ WebSocket closing: $code ${reason.ifEmpty { "(no reason)" }}")
+
+                // ★ 分析关闭原因
+                if (totalBytesReceived < 100 && code == 1000) {
+                    Log.e(TAG, "========== POTENTIAL ISSUE ==========")
+                    Log.e(TAG, "Server closed immediately after sending $totalBytesReceived bytes")
+                    Log.e(TAG, "This usually means:")
+                    Log.e(TAG, "  1. VLESS UUID is incorrect or unauthorized")
+                    Log.e(TAG, "  2. Server rejected the connection")
+                    Log.e(TAG, "  3. Protocol mismatch")
+                    Log.e(TAG, "=====================================")
+                }
+
                 inQueue.offer(END_MARKER)
                 webSocket.close(1000, null)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                Log.d(TAG, "WebSocket closed: $code $reason")
+                closeCode = code
+                closeReason = reason
+                Log.d(TAG, "WebSocket closed: $code ${reason.ifEmpty { "(no reason)" }}")
                 inQueue.offer(END_MARKER)
             }
 
@@ -133,7 +161,29 @@ class VlessTunnel(
                 Log.e(TAG, "✗ WebSocket failure: ${t.javaClass.simpleName}: ${t.message}")
                 if (response != null) {
                     Log.e(TAG, "  Response: ${response.code} ${response.message}")
+                    Log.e(TAG, "  Headers: ${response.headers}")
                 }
+
+                // ★ 常见错误诊断
+                when {
+                    t.message?.contains("refused", true) == true -> {
+                        Log.e(TAG, "  → Server refused connection (check server/port)")
+                    }
+                    t.message?.contains("timeout", true) == true -> {
+                        Log.e(TAG, "  → Connection timeout (check network/firewall)")
+                    }
+                    t.message?.contains("SSL", true) == true ||
+                            t.message?.contains("certificate", true) == true -> {
+                        Log.e(TAG, "  → TLS/SSL error (check security config)")
+                    }
+                    response?.code == 404 -> {
+                        Log.e(TAG, "  → Path not found (check WebSocket path: ${cfg.path})")
+                    }
+                    response?.code == 401 || response?.code == 403 -> {
+                        Log.e(TAG, "  → Authentication failed (check UUID)")
+                    }
+                }
+
                 inQueue.offer(END_MARKER)
 
                 if (!resultSent) {
@@ -142,6 +192,64 @@ class VlessTunnel(
                 }
             }
         })
+    }
+
+    /**
+     * ★ 分析第一个响应包，检测潜在问题
+     */
+    private fun analyzeFirstResponse(data: ByteArray) {
+        Log.d(TAG, "========== First Response Analysis ==========")
+        Log.d(TAG, "Size: ${data.size} bytes")
+
+        if (data.size < 2) {
+            Log.e(TAG, "⚠ Response too short (< 2 bytes)")
+            return
+        }
+
+        val version = data[0].toInt() and 0xFF
+        val addonLen = data[1].toInt() and 0xFF
+
+        Log.d(TAG, "VLESS response:")
+        Log.d(TAG, "  Version: 0x${"%02x".format(version)}")
+        Log.d(TAG, "  Addon length: $addonLen")
+
+        if (version != 0) {
+            Log.e(TAG, "⚠ Unexpected VLESS version: $version (expected 0)")
+        }
+
+        val headerLen = 2 + addonLen
+        val payloadLen = data.size - headerLen
+
+        Log.d(TAG, "  Header: $headerLen bytes")
+        Log.d(TAG, "  Payload: $payloadLen bytes")
+
+        // ★ 检测异常模式
+        when {
+            payloadLen == 0 -> {
+                Log.w(TAG, "⚠ No payload after VLESS header")
+                Log.w(TAG, "  Server might have closed without sending data")
+            }
+            payloadLen < 100 && data.size < 100 -> {
+                Log.w(TAG, "⚠ Very small response ($payloadLen bytes payload)")
+                Log.w(TAG, "  This might be an error message or rejection")
+
+                // 尝试解析为 ASCII
+                val ascii = payload(data, headerLen).toString(Charsets.ISO_8859_1)
+                if (ascii.matches(Regex("[\\x20-\\x7E]+"))) {
+                    Log.w(TAG, "  Possible error message: $ascii")
+                }
+            }
+            else -> {
+                Log.d(TAG, "✓ Normal-sized response")
+            }
+        }
+
+        Log.d(TAG, "============================================")
+    }
+
+    private fun payload(data: ByteArray, headerLen: Int): ByteArray {
+        return if (data.size > headerLen) data.copyOfRange(headerLen, data.size)
+        else ByteArray(0)
     }
 
     private fun sendVlessHeader(data: ByteArray? = null) {
@@ -153,6 +261,12 @@ class VlessTunnel(
         headerSent = true
 
         val header = VlessProtocol.buildHeader(cfg.uuid, destHost, destPort)
+
+        // ★ 验证头部格式
+        val validation = VlessDiagnostic.validateVlessHeader(header)
+        if (validation != null) {
+            Log.e(TAG, "⚠ VLESS header validation warning: $validation")
+        }
 
         val packet = if (data != null && data.isNotEmpty()) {
             Log.d(TAG, "Sending header (${header.size}B) + data (${data.size}B)")
@@ -171,7 +285,6 @@ class VlessTunnel(
             return
         }
 
-        // ★ 在 relay 中处理响应头，避免竞态条件
         var firstResponseProcessed = false
 
         // ★ 从服务器接收数据 → 写入本地
@@ -188,7 +301,6 @@ class VlessTunnel(
                         break
                     }
 
-                    // ★ 关键修复：在这里处理响应头
                     val payload = if (!firstResponseProcessed && chunk.size >= 2) {
                         firstResponseProcessed = true
 
@@ -215,7 +327,6 @@ class VlessTunnel(
                             ByteArray(0)
                         }
                     } else {
-                        // 后续数据包直接使用
                         chunk
                     }
 
@@ -239,6 +350,9 @@ class VlessTunnel(
                 }
             } finally {
                 Log.d(TAG, "WS→local thread ending")
+                Log.d(TAG, "  Total received: $totalBytesReceived bytes")
+                Log.d(TAG, "  Close code: $closeCode")
+                Log.d(TAG, "  Close reason: ${closeReason.ifEmpty { "(none)" }}")
                 runCatching { localOut.close() }
                 ws?.cancel()
             }

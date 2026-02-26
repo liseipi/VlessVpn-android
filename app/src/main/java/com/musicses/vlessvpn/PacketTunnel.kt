@@ -5,11 +5,12 @@ import android.util.Log
 import java.io.FileDescriptor
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.io.InputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 private const val TAG = "PacketTunnel"
 private const val MTU = 1500
@@ -23,6 +24,8 @@ private const val MTU = 1500
  *  5. 构造假的 TCP ACK 回包写回 TUN，让本地 TCP 栈正常工作
  *
  * 流标识：srcIP:srcPort -> dstIP:dstPort
+ *
+ * ★ 修复了竞态条件：使用 CountDownLatch 确保连接建立后再发送数据
  */
 class PacketTunnel(
     private val fd: FileDescriptor,
@@ -95,8 +98,6 @@ class PacketTunnel(
         val isSyn = (flags and 0x02) != 0
         val isFin = (flags and 0x01) != 0
         val isRst = (flags and 0x04) != 0
-        val isPsh = (flags and 0x08) != 0
-        val isAck = (flags and 0x10) != 0
 
         val flowKey = "$srcIp:$srcPort->$dstIp:$dstPort"
 
@@ -106,7 +107,7 @@ class PacketTunnel(
         else ByteArray(0)
 
         when {
-            isSyn && !isAck -> {
+            isSyn && (flags and 0x10) == 0 -> {  // SYN without ACK
                 Log.d(TAG, "SYN: $flowKey")
                 val flow = TcpFlow(
                     srcIp, srcPort, dstIp, dstPort,
@@ -159,25 +160,30 @@ private class TcpFlow(
     private val pipe    = java.io.PipedOutputStream()
     private val pipeIn  = java.io.PipedInputStream(pipe, 65536)
 
+    // ★ 关键修复：使用 CountDownLatch 同步连接状态
+    private val connectLatch = CountDownLatch(1)
+
     private var serverSeq = System.currentTimeMillis() and 0xFFFFFFFFL
     private var clientAck = clientSeq + 1
 
     @Volatile private var closed = false
-    @Volatile private var connected = false  // ← 添加连接状态标记
+    @Volatile private var connected = false
 
     fun handleSyn() {
         writeSynAck()
 
-        // ★ 关键修复：在隧道建立后再启动 relay
+        // 异步建立隧道连接
         tunnel.connect(dstIp, dstPort) { ok ->
             if (!ok) {
                 Log.e(TAG, "[$srcIp:$srcPort→$dstIp:$dstPort] Tunnel connection failed")
+                connectLatch.countDown()  // ← 释放锁（连接失败）
                 close()
                 return@connect
             }
 
             connected = true
-            Log.d(TAG, "[$srcIp:$srcPort→$dstIp:$dstPort] Tunnel connected, starting relay")
+            connectLatch.countDown()  // ← 释放锁（连接成功）
+            Log.d(TAG, "[$srcIp:$srcPort→$dstIp:$dstPort] ✓ Tunnel connected, starting relay")
 
             // 启动中继线程
             Thread {
@@ -193,9 +199,7 @@ private class TcpFlow(
                         onStats = onStats
                     )
 
-                    // ★ 这里是关键：relay 会阻塞直到连接结束
                     tunnel.relay(pipeIn, tunOutputStream)
-
                     Log.d(TAG, "[$srcIp:$srcPort→$dstIp:$dstPort] Relay completed")
                 } catch (e: Exception) {
                     Log.e(TAG, "[$srcIp:$srcPort→$dstIp:$dstPort] Relay error: ${e.message}")
@@ -210,17 +214,19 @@ private class TcpFlow(
     }
 
     fun send(data: ByteArray) {
-        if (closed || !connected) {
-            // 如果还没连接，等待一下
-            if (!connected) {
-                Thread.sleep(50)
-                if (!connected) {
-                    Log.w(TAG, "[$srcIp:$srcPort→$dstIp:$dstPort] Dropping ${data.size}B (not connected)")
-                    return
-                }
-            } else {
-                return
-            }
+        if (closed) return
+
+        // ★ 等待连接建立（最多 5 秒）
+        if (!connectLatch.await(5, TimeUnit.SECONDS)) {
+            Log.w(TAG, "[$srcIp:$srcPort→$dstIp:$dstPort] ✗ Connection timeout (5s), dropping ${data.size}B")
+            close()
+            return
+        }
+
+        // ★ 检查连接是否成功
+        if (!connected) {
+            Log.w(TAG, "[$srcIp:$srcPort→$dstIp:$dstPort] ✗ Connection failed, dropping ${data.size}B")
+            return
         }
 
         try {
@@ -246,7 +252,7 @@ private class TcpFlow(
             dstIp   = srcIp,   dstPort = srcPort,
             seq     = serverSeq,
             ack     = clientSeq + 1,
-            flags   = 0x12,
+            flags   = 0x12,  // SYN + ACK
             payload = ByteArray(0)
         )
         serverSeq++
@@ -268,7 +274,6 @@ private class TunOutputStream(
 ) : OutputStream() {
 
     private var totalIn = 0L
-    private val TAG = "TunOutputStream"
 
     override fun write(b: Int) = write(byteArrayOf(b.toByte()))
 
