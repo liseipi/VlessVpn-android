@@ -1,5 +1,5 @@
 [versions]
-agp = "8.5.2"                         # ✅ 降到稳定版，9.x 仍是 alpha
+agp = "8.13.2"
 kotlin = "2.0.21"
 coreKtx = "1.13.1"
 junit = "4.13.2"
@@ -8,8 +8,8 @@ espressoCore = "3.6.1"
 lifecycleRuntimeKtx = "2.8.4"
 activityCompose = "1.9.1"
 composeBom = "2024.09.00"
-okhttp = "4.12.0"                     # ✅ 新增
-coroutines = "1.8.1"                  # ✅ 新增
+okhttp = "4.12.0"
+coroutines = "1.8.1"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }

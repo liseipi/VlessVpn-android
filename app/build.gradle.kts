@@ -6,12 +6,12 @@ plugins {
 
 android {
     namespace = "com.musicses.vlessvpn"
-    compileSdk = 35          // ✅ 修复：去掉错误的 release{} DSL
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.musicses.vlessvpn"
-        minSdk = 26           // ✅ 提升到 26，readNBytes() 需要 API 26+
-        targetSdk = 35
+        minSdk = 26
+        targetSdk = 36
         versionCode = 1
         versionName = "1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnit4"
