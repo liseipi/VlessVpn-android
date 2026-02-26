@@ -30,7 +30,7 @@ class VlessVpnService : VpnService() {
     }
 
     private var tun: ParcelFileDescriptor? = null
-    private var tunHandler: TunHandler? = null
+    private var packetTunnel: PacketTunnel? = null  // ← 改用 PacketTunnel
     @Volatile private var running = false
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -89,24 +89,8 @@ class VlessVpnService : VpnService() {
                 Log.d(TAG, "  SNI: ${cfg.sni}")
                 broadcast("CONNECTING")
 
-                // 步骤 2: 启动 SOCKS5 代理（传递 this 作为 VpnService）
-                Log.d(TAG, "Step 2: Starting SOCKS5 proxy...")
-                val handler = TunHandler(null, cfg, this) { bytesIn, bytesOut ->  // ← 传递 this
-                    sendBroadcast(
-                        Intent(BROADCAST)
-                            .putExtra(EXTRA_STATUS, "CONNECTED")
-                            .putExtra(EXTRA_IN, bytesIn)
-                            .putExtra(EXTRA_OUT, bytesOut)
-                    )
-                    updateNotif("↓ ${fmt(bytesIn)}  ↑ ${fmt(bytesOut)}")
-                }
-                handler.start()
-                val socksPort = handler.getSocksPort()
-                tunHandler = handler
-                Log.i(TAG, "✓ SOCKS5 proxy listening on 127.0.0.1:$socksPort")
-
-                // 步骤 3: 建立 TUN 接口
-                Log.d(TAG, "Step 3: Establishing TUN interface...")
+                // 步骤 2: 建立 TUN 接口
+                Log.d(TAG, "Step 2: Establishing TUN interface...")
                 val tunBuilder = Builder()
                     .setSession("VlessVPN")
                     .setMtu(MTU)
@@ -128,16 +112,31 @@ class VlessVpnService : VpnService() {
                     Log.e(TAG, "  2. Another VPN is already active")
                     Log.e(TAG, "  3. System VPN service is unavailable")
                     broadcast("ERROR")
-                    handler.stop()
                     return@Thread
                 }
                 tun = tunPfd
                 Log.i(TAG, "✓ TUN interface established, fd=${tunPfd.fd}")
 
-                // 步骤 4: 连接 TUN 和 handler
-                Log.d(TAG, "Step 4: Linking TUN to handler...")
-                handler.setTunFd(tunPfd.fileDescriptor)
-                Log.i(TAG, "✓ TUN linked to handler")
+                // 步骤 3: 启动 PacketTunnel（处理 TUN 数据包）
+                Log.d(TAG, "Step 3: Starting PacketTunnel...")
+                val pt = PacketTunnel(
+                    tunPfd.fileDescriptor,
+                    cfg,
+                    this  // ← 传递 VpnService 实例用于 protect
+                ) { bytesIn, bytesOut ->
+                    // 流量统计回调
+                    val intent = Intent(BROADCAST).apply {
+                        putExtra(EXTRA_STATUS, "CONNECTED")
+                        putExtra(EXTRA_IN, bytesIn)
+                        putExtra(EXTRA_OUT, bytesOut)
+                        setPackage(packageName)  // ← 指定接收包名
+                    }
+                    sendBroadcast(intent)
+                    updateNotif("↓ ${fmt(bytesIn)}  ↑ ${fmt(bytesOut)}")
+                }
+                packetTunnel = pt
+                pt.start()
+                Log.i(TAG, "✓ PacketTunnel started")
 
                 // 完成
                 Log.i(TAG, "========== VPN Connected ==========")
@@ -184,12 +183,12 @@ class VlessVpnService : VpnService() {
         running = false
 
         try {
-            tunHandler?.let {
-                Log.d(TAG, "Stopping TUN handler...")
+            packetTunnel?.let {
+                Log.d(TAG, "Stopping PacketTunnel...")
                 it.stop()
-                Log.d(TAG, "✓ TUN handler stopped")
+                Log.d(TAG, "✓ PacketTunnel stopped")
             }
-            tunHandler = null
+            packetTunnel = null
 
             tun?.let {
                 Log.d(TAG, "Closing TUN interface...")
@@ -244,7 +243,11 @@ class VlessVpnService : VpnService() {
 
     private fun broadcast(status: String) {
         Log.d(TAG, "Broadcasting status: $status")
-        sendBroadcast(Intent(BROADCAST).putExtra(EXTRA_STATUS, status))
+        val intent = Intent(BROADCAST).apply {
+            putExtra(EXTRA_STATUS, status)
+            setPackage(packageName)  // ← 添加包名，确保只发送给本应用
+        }
+        sendBroadcast(intent)
     }
 
     private fun fmt(b: Long) = when {

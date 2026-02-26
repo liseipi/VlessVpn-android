@@ -1,5 +1,6 @@
 package com.musicses.vlessvpn
 
+import android.net.VpnService
 import android.util.Log
 import java.io.FileDescriptor
 import java.io.FileInputStream
@@ -26,6 +27,7 @@ private const val MTU = 1500
 class PacketTunnel(
     private val fd: FileDescriptor,
     private val cfg: VlessConfig,
+    private val vpnService: VpnService? = null,  // ← 添加 VpnService 用于 protect
     private val onStats: (bytesIn: Long, bytesOut: Long) -> Unit
 ) {
     private val executor   = Executors.newCachedThreadPool()
@@ -106,7 +108,7 @@ class PacketTunnel(
         val dataOffset = ((pkt[ihl + 12].toInt() and 0xFF) ushr 4) * 4
         val payloadStart = ihl + dataOffset
         val payload = if (pkt.size > payloadStart) pkt.copyOfRange(payloadStart, pkt.size)
-                      else ByteArray(0)
+        else ByteArray(0)
 
         when {
             isSyn && !isAck -> {
@@ -115,7 +117,7 @@ class PacketTunnel(
                 val flow = TcpFlow(
                     srcIp, srcPort, dstIp, dstPort,
                     seqFromPkt(pkt, ihl),
-                    cfg, tunOut
+                    cfg, vpnService, tunOut  // ← 传递 vpnService
                 ) { bytesIn, bytesOut ->
                     totalIn  += bytesIn
                     totalOut += bytesOut
@@ -135,13 +137,13 @@ class PacketTunnel(
 
     private fun formatIp(pkt: ByteArray, offset: Int) =
         "${pkt[offset].toInt() and 0xFF}.${pkt[offset+1].toInt() and 0xFF}" +
-        ".${pkt[offset+2].toInt() and 0xFF}.${pkt[offset+3].toInt() and 0xFF}"
+                ".${pkt[offset+2].toInt() and 0xFF}.${pkt[offset+3].toInt() and 0xFF}"
 
     private fun seqFromPkt(pkt: ByteArray, ihl: Int): Long {
         return ((pkt[ihl+4].toLong() and 0xFF) shl 24) or
-               ((pkt[ihl+5].toLong() and 0xFF) shl 16) or
-               ((pkt[ihl+6].toLong() and 0xFF) shl 8)  or
-               (pkt[ihl+7].toLong()  and 0xFF)
+                ((pkt[ihl+5].toLong() and 0xFF) shl 16) or
+                ((pkt[ihl+6].toLong() and 0xFF) shl 8)  or
+                (pkt[ihl+7].toLong()  and 0xFF)
     }
 }
 
@@ -154,10 +156,11 @@ private class TcpFlow(
     private val dstPort: Int,
     private val clientSeq: Long,         // 客户端初始序号
     private val cfg: VlessConfig,
+    private val vpnService: VpnService?,  // ← 添加 VpnService
     private val tunOut: FileOutputStream,
     private val onStats: (Long, Long) -> Unit
 ) {
-    private val tunnel  = VlessTunnel(cfg)
+    private val tunnel  = VlessTunnel(cfg, vpnService)  // ← 传递 vpnService
     private val pipe    = java.io.PipedOutputStream()
     private val pipeIn  = java.io.PipedInputStream(pipe, 65536)
 
