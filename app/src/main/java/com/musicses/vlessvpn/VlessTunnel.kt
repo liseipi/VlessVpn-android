@@ -20,7 +20,9 @@ private const val TAG = "VlessTunnel"
 /**
  * VLESS over WebSocket 隧道
  *
- * ★ 增强版：增加详细的服务器响应分析和错误诊断
+ * ★★★ 关键修复 ★★★
+ * 问题：之前分开发送 VLESS header 和数据，导致服务器 pendingData 为空
+ * 修复：确保首包同时包含 header + payload，匹配 Node.js 客户端行为
  */
 class VlessTunnel(
     private val cfg: VlessConfig,
@@ -31,7 +33,7 @@ class VlessTunnel(
     @Volatile private var closed = false
     @Volatile private var headerSent = false
 
-    // ★ 诊断信息
+    // 诊断信息
     private var totalBytesReceived = 0
     private var closeCode = -1
     private var closeReason = ""
@@ -86,11 +88,15 @@ class VlessTunnel(
                 Log.d(TAG, "  TLS version: ${response.handshake?.tlsVersion}")
                 Log.d(TAG, "  Target: $destHost:$destPort")
 
+                // ★ 关键修复：立即发送 VLESS header + earlyData
+                // 服务器需要在首包中同时收到 header 和 payload
                 if (earlyData != null && earlyData.isNotEmpty()) {
-                    Log.d(TAG, "Sending VLESS header + early data (${earlyData.size} bytes)")
-                    sendVlessHeader(earlyData)
+                    Log.d(TAG, "Sending VLESS header + early data (${earlyData.size} bytes) in ONE packet")
+                    sendVlessHeaderWithData(earlyData)
+                    headerSent = true
                 } else {
-                    Log.d(TAG, "No early data, will send header with first packet")
+                    Log.d(TAG, "No early data - will send header with first packet from relay")
+                    headerSent = false
                 }
 
                 if (!resultSent) {
@@ -106,7 +112,7 @@ class VlessTunnel(
 
                     Log.d(TAG, "← Received ${data.size} bytes from server (total: $totalBytesReceived)")
 
-                    // ★ 分析第一个响应包
+                    // 分析第一个响应包
                     if (totalBytesReceived == data.size) {
                         analyzeFirstResponse(data)
                     }
@@ -135,7 +141,6 @@ class VlessTunnel(
                 closeReason = reason
                 Log.w(TAG, "⚠ WebSocket closing: $code ${reason.ifEmpty { "(no reason)" }}")
 
-                // ★ 分析关闭原因
                 if (totalBytesReceived < 100 && code == 1000) {
                     Log.e(TAG, "========== POTENTIAL ISSUE ==========")
                     Log.e(TAG, "Server closed immediately after sending $totalBytesReceived bytes")
@@ -161,27 +166,6 @@ class VlessTunnel(
                 Log.e(TAG, "✗ WebSocket failure: ${t.javaClass.simpleName}: ${t.message}")
                 if (response != null) {
                     Log.e(TAG, "  Response: ${response.code} ${response.message}")
-                    Log.e(TAG, "  Headers: ${response.headers}")
-                }
-
-                // ★ 常见错误诊断
-                when {
-                    t.message?.contains("refused", true) == true -> {
-                        Log.e(TAG, "  → Server refused connection (check server/port)")
-                    }
-                    t.message?.contains("timeout", true) == true -> {
-                        Log.e(TAG, "  → Connection timeout (check network/firewall)")
-                    }
-                    t.message?.contains("SSL", true) == true ||
-                            t.message?.contains("certificate", true) == true -> {
-                        Log.e(TAG, "  → TLS/SSL error (check security config)")
-                    }
-                    response?.code == 404 -> {
-                        Log.e(TAG, "  → Path not found (check WebSocket path: ${cfg.path})")
-                    }
-                    response?.code == 401 || response?.code == 403 -> {
-                        Log.e(TAG, "  → Authentication failed (check UUID)")
-                    }
                 }
 
                 inQueue.offer(END_MARKER)
@@ -194,9 +178,6 @@ class VlessTunnel(
         })
     }
 
-    /**
-     * ★ 分析第一个响应包，检测潜在问题
-     */
     private fun analyzeFirstResponse(data: ByteArray) {
         Log.d(TAG, "========== First Response Analysis ==========")
         Log.d(TAG, "Size: ${data.size} bytes")
@@ -223,7 +204,6 @@ class VlessTunnel(
         Log.d(TAG, "  Header: $headerLen bytes")
         Log.d(TAG, "  Payload: $payloadLen bytes")
 
-        // ★ 检测异常模式
         when {
             payloadLen == 0 -> {
                 Log.w(TAG, "⚠ No payload after VLESS header")
@@ -231,13 +211,6 @@ class VlessTunnel(
             }
             payloadLen < 100 && data.size < 100 -> {
                 Log.w(TAG, "⚠ Very small response ($payloadLen bytes payload)")
-                Log.w(TAG, "  This might be an error message or rejection")
-
-                // 尝试解析为 ASCII
-                val ascii = payload(data, headerLen).toString(Charsets.ISO_8859_1)
-                if (ascii.matches(Regex("[\\x20-\\x7E]+"))) {
-                    Log.w(TAG, "  Possible error message: $ascii")
-                }
             }
             else -> {
                 Log.d(TAG, "✓ Normal-sized response")
@@ -247,11 +220,30 @@ class VlessTunnel(
         Log.d(TAG, "============================================")
     }
 
-    private fun payload(data: ByteArray, headerLen: Int): ByteArray {
-        return if (data.size > headerLen) data.copyOfRange(headerLen, data.size)
-        else ByteArray(0)
+    /**
+     * ★ 新方法：一次性发送 VLESS header + data
+     * 这是关键修复，确保服务器能在首包中收到 payload
+     */
+    private fun sendVlessHeaderWithData(data: ByteArray) {
+        val header = VlessProtocol.buildHeader(cfg.uuid, destHost, destPort)
+
+        // 验证头部格式
+        val validation = VlessDiagnostic.validateVlessHeader(header)
+        if (validation != null) {
+            Log.e(TAG, "⚠ VLESS header validation warning: $validation")
+        }
+
+        // ★ 关键：header + data 合并成一个包发送
+        val packet = header + data
+        Log.d(TAG, "→ Sending combined packet: header(${header.size}B) + data(${data.size}B) = ${packet.size}B total")
+
+        ws?.send(packet.toByteString())
     }
 
+    /**
+     * 旧方法：仅发送 header 或 header + data
+     * 保留用于兼容，但确保合并发送
+     */
     private fun sendVlessHeader(data: ByteArray? = null) {
         if (headerSent) {
             Log.w(TAG, "Header already sent")
@@ -262,7 +254,6 @@ class VlessTunnel(
 
         val header = VlessProtocol.buildHeader(cfg.uuid, destHost, destPort)
 
-        // ★ 验证头部格式
         val validation = VlessDiagnostic.validateVlessHeader(header)
         if (validation != null) {
             Log.e(TAG, "⚠ VLESS header validation warning: $validation")
@@ -373,9 +364,11 @@ class VlessTunnel(
 
                     val data = buf.copyOf(n)
 
+                    // ★ 关键修复：如果还没发送 header，则 header + data 一起发送
                     if (!headerSent) {
-                        Log.d(TAG, "First data from local (${data.size}B), sending with header")
-                        sendVlessHeader(data)
+                        Log.d(TAG, "First data from local (${data.size}B), sending with header in ONE packet")
+                        sendVlessHeaderWithData(data)
+                        headerSent = true
                     } else {
                         ws?.send(data.toByteString())
                     }
@@ -392,6 +385,7 @@ class VlessTunnel(
                     Log.e(TAG, "local→WS error: ${e.javaClass.simpleName}: ${e.message}")
                 }
             } finally {
+                // ★ 如果到现在还没发送 header，发送一个空 payload 的
                 if (!headerSent) {
                     Log.w(TAG, "No data sent, sending header only")
                     sendVlessHeader()

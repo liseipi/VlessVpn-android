@@ -25,7 +25,7 @@ private const val MTU = 1500
  *
  * 流标识：srcIP:srcPort -> dstIP:dstPort
  *
- * ★ 修复了竞态条件：使用 CountDownLatch 确保连接建立后再发送数据
+ * ★ 修复：增加连接超时时间为 15 秒，因为 VLESS 连接建立可能较慢
  */
 class PacketTunnel(
     private val fd: FileDescriptor,
@@ -160,7 +160,7 @@ private class TcpFlow(
     private val pipe    = java.io.PipedOutputStream()
     private val pipeIn  = java.io.PipedInputStream(pipe, 65536)
 
-    // ★ 关键修复：使用 CountDownLatch 同步连接状态
+    // ★ 关键修复：增加超时时间为 15 秒
     private val connectLatch = CountDownLatch(1)
 
     private var serverSeq = System.currentTimeMillis() and 0xFFFFFFFFL
@@ -176,13 +176,13 @@ private class TcpFlow(
         tunnel.connect(dstIp, dstPort) { ok ->
             if (!ok) {
                 Log.e(TAG, "[$srcIp:$srcPort→$dstIp:$dstPort] Tunnel connection failed")
-                connectLatch.countDown()  // ← 释放锁（连接失败）
+                connectLatch.countDown()  // 释放锁（连接失败）
                 close()
                 return@connect
             }
 
             connected = true
-            connectLatch.countDown()  // ← 释放锁（连接成功）
+            connectLatch.countDown()  // 释放锁（连接成功）
             Log.d(TAG, "[$srcIp:$srcPort→$dstIp:$dstPort] ✓ Tunnel connected, starting relay")
 
             // 启动中继线程
@@ -216,14 +216,14 @@ private class TcpFlow(
     fun send(data: ByteArray) {
         if (closed) return
 
-        // ★ 等待连接建立（最多 5 秒）
-        if (!connectLatch.await(5, TimeUnit.SECONDS)) {
-            Log.w(TAG, "[$srcIp:$srcPort→$dstIp:$dstPort] ✗ Connection timeout (5s), dropping ${data.size}B")
+        // ★ 等待连接建立（增加到 15 秒）
+        if (!connectLatch.await(15, TimeUnit.SECONDS)) {
+            Log.w(TAG, "[$srcIp:$srcPort→$dstIp:$dstPort] ✗ Connection timeout (15s), dropping ${data.size}B")
             close()
             return
         }
 
-        // ★ 检查连接是否成功
+        // 检查连接是否成功
         if (!connected) {
             Log.w(TAG, "[$srcIp:$srcPort→$dstIp:$dstPort] ✗ Connection failed, dropping ${data.size}B")
             return
