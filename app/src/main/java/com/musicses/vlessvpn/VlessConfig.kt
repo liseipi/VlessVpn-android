@@ -23,7 +23,7 @@ data class VlessConfig(
     val path: String = "/?ed=2560",
     val sni: String = "vs.musicses.vip",
     val wsHost: String = "vs.musicses.vip",
-    val security: String = "none",          // none | tls
+    val security: String = "tls",          // none | tls
     val rejectUnauthorized: Boolean = false,
     val dns1: String = "8.8.8.8",
     val dns2: String = "8.8.4.4",
