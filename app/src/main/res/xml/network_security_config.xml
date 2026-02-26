@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- 允许 VLESS 服务器的连接（包括自签名证书） -->
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="true">vs.musicses.vip</domain>
+        <trust-anchors>
+            <!-- 信任系统证书 -->
+            <certificates src="system" />
+            <!-- 信任用户安装的证书（用于自签名） -->
+            <certificates src="user" />
+        </trust-anchors>
+    </domain-config>
+
+    <!-- 默认配置：禁止明文流量 -->
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
