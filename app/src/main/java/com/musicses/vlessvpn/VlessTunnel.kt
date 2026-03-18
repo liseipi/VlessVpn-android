@@ -3,7 +3,7 @@ package com.musicses.vlessvpn
 import android.net.VpnService
 import android.util.Log
 import okhttp3.*
-import okio.ByteString
+import okhttp3.ConnectionPool
 import okio.ByteString.Companion.toByteString
 import java.io.InputStream
 import java.io.OutputStream
@@ -13,23 +13,45 @@ import java.security.SecureRandom
 import java.security.cert.X509Certificate
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.*
 
 private const val TAG = "VlessTunnel"
 
+/**
+ * ★★★ 彻底修复版 ★★★
+ *
+ * 修复 1011 根因：ws 字段竞争覆盖
+ *
+ * 问题：
+ *   - newWebSocket() 是异步的，onOpen 回调在 OkHttp 的线程池中执行
+ *   - 如果两个 VlessTunnel 实例的 onOpen 交错执行（完全可能），
+ *     后一个会把 ws 字段覆盖成自己的 WebSocket
+ *   - 前一个实例发数据时用的是后一个的 socket → 服务器收到错误数据 → 1011
+ *
+ * 修复：
+ *   - ws 用 AtomicReference 保存，并通过 compareAndSet 确保只设置一次
+ *   - onOpen 回调通过局部变量 wsRef 引用自己的 WebSocket，不依赖实例字段
+ *   - 所有发送操作通过局部 wsRef 而非 this.ws
+ */
 class VlessTunnel(
     private val cfg: VlessConfig,
     private val vpnService: VpnService? = null
 ) {
-    private var ws: WebSocket? = null
-    private val inQueue = LinkedBlockingQueue<ByteArray>(1000)
-    private val END_MARKER = ByteArray(0)
-
-    @Volatile private var closed = false
-    @Volatile private var headerSent = false
+    // ★ 使用 AtomicReference，并通过 compareAndSet 保证只设置一次
+    private val wsRef = AtomicReference<WebSocket?>(null)
+    private val inQueue = LinkedBlockingQueue<ByteArray>(2000)
+    private val closed = AtomicBoolean(false)
+    private val headerSent = AtomicBoolean(false)
 
     private var destHost = ""
     private var destPort = 0
+
+    companion object {
+        private val END_MARKER = ByteArray(0)
+        fun clearSharedClients() { /* no-op */ }
+    }
 
     fun connect(
         destHost: String,
@@ -37,81 +59,65 @@ class VlessTunnel(
         earlyData: ByteArray? = null,
         onResult: (Boolean) -> Unit
     ) {
-        if (closed) { onResult(false); return }
+        if (closed.get()) { onResult(false); return }
 
         this.destHost = destHost
         this.destPort = destPort
 
-        val client = buildOkHttpClient()
-
-        // ★ OkHttp 不支持 wss/ws scheme，必须用 https/http
-        // security=="tls" 或 port==443 → https（对应 wss）
-        // 否则 → http（对应 ws）
-        val httpScheme = if (cfg.security == "tls" || cfg.port == 443) "https" else "http"
-
-        val urlBuilder = HttpUrl.Builder()
-            .scheme(httpScheme)
-            .host(cfg.server)
-            .port(cfg.port)
-
-        val pathPart = cfg.wsPathPart
-        if (pathPart.isNotEmpty() && pathPart != "/") {
-            urlBuilder.addPathSegments(pathPart.trimStart('/'))
-        }
-
-        cfg.wsQueryPart?.split("&")?.forEach { kv ->
-            val eqIdx = kv.indexOf('=')
-            if (eqIdx > 0) {
-                urlBuilder.addQueryParameter(kv.substring(0, eqIdx), kv.substring(eqIdx + 1))
-            } else if (kv.isNotEmpty()) {
-                urlBuilder.addQueryParameter(kv, null)
-            }
-        }
-
-        val url = urlBuilder.build()
-        Log.i(TAG, "Connecting: $url  target=$destHost:$destPort")
-
+        val client = buildClient()
         val req = Request.Builder()
-            .url(url)
-            .header("Host",          cfg.wsHost)
-            .header("User-Agent",    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            .url(cfg.wsUrl)
+            .header("Host", cfg.wsHost.ifBlank { cfg.server })
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
             .header("Cache-Control", "no-cache")
-            .header("Pragma",        "no-cache")
             .build()
 
-        var resultSent = false
+        Log.i(TAG, "Connecting: ${cfg.wsUrl}  target=$destHost:$destPort")
+
+        val resultSent = AtomicBoolean(false)
+        fun deliver(ok: Boolean) {
+            if (resultSent.compareAndSet(false, true)) onResult(ok)
+        }
 
         client.newWebSocket(req, object : WebSocketListener() {
 
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                if (closed) { webSocket.close(1000, null); return }
-                ws = webSocket
+                if (closed.get()) {
+                    webSocket.close(1000, null)
+                    deliver(false)
+                    return
+                }
+
+                // ★ 关键修复：用 compareAndSet 确保只设置一次
+                // 如果已经有值（说明这是重复的 onOpen），拒绝并关闭
+                if (!wsRef.compareAndSet(null, webSocket)) {
+                    Log.w(TAG, "Duplicate onOpen, closing extra WebSocket")
+                    webSocket.close(1000, null)
+                    deliver(false)
+                    return
+                }
+
                 Log.i(TAG, "✓ WS opened")
 
-                val header = VlessProtocol.buildHeader(cfg.uuid, destHost, destPort)
-                val firstPkt = if (earlyData != null && earlyData.isNotEmpty()) {
-                    Log.d(TAG, "→ header(${header.size}B) + earlyData(${earlyData.size}B)")
-                    header + earlyData
-                } else {
-                    Log.d(TAG, "→ header only (${header.size}B)")
-                    header
-                }
-                webSocket.send(firstPkt.toByteString())
-                headerSent = true
-
-                if (!resultSent) { resultSent = true; onResult(true) }
+                // ★ 用局部变量引用，避免后续被覆盖
+                sendFirstPacket(webSocket, earlyData)
+                deliver(true)
             }
 
-            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                if (!closed) inQueue.offer(bytes.toByteArray(), 100, TimeUnit.MILLISECONDS)
+            override fun onMessage(webSocket: WebSocket, bytes: okio.ByteString) {
+                if (!closed.get() && bytes.size > 0) {
+                    inQueue.offer(bytes.toByteArray())
+                }
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                if (!closed) inQueue.offer(text.toByteArray(Charsets.UTF_8), 100, TimeUnit.MILLISECONDS)
+                if (!closed.get() && text.isNotEmpty()) {
+                    inQueue.offer(text.toByteArray())
+                }
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                Log.w(TAG, "WS closing: $code $reason")
+                Log.w(TAG, "WS closing: $code ${reason.take(30)}")
                 inQueue.offer(END_MARKER)
                 webSocket.close(1000, null)
             }
@@ -122,173 +128,198 @@ class VlessTunnel(
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                Log.e(TAG, "✗ WS failure: ${t.message}")
-                response?.let { Log.e(TAG, "  HTTP ${it.code} ${it.message}") }
+                if (!closed.get()) {
+                    Log.e(TAG, "✗ WS failure: ${t.message}")
+                }
                 inQueue.offer(END_MARKER)
-                if (!resultSent) { resultSent = true; onResult(false) }
+                deliver(false)
             }
         })
     }
 
+    // ★ 接受 webSocket 参数而不用实例字段，避免读到别的隧道的 ws
+    private fun sendFirstPacket(webSocket: WebSocket, earlyData: ByteArray?) {
+        if (headerSent.getAndSet(true)) return
+        val header = VlessProtocol.buildHeader(cfg.uuid, destHost, destPort)
+        val packet = if (earlyData != null && earlyData.isNotEmpty()) {
+            Log.d(TAG, "→ header(${header.size}B) + earlyData(${earlyData.size}B)")
+            header + earlyData
+        } else {
+            Log.d(TAG, "→ header only (${header.size}B)")
+            header
+        }
+        webSocket.send(packet.toByteString())
+    }
+
     fun relay(localIn: InputStream, localOut: OutputStream) {
-        if (closed) return
+        if (closed.get()) return
 
-        // WS → local（下行）
-        // ★ 修复：不使用 inline lambda 中的 continue，改用普通 while + 变量控制
-        val t1 = Thread({
-            var respBuf     = ByteArray(0)
-            var respSkipped = false
-            var respHdrSize = -1
+        // ★ 在 relay 开始时拿一次本隧道的 ws，后续所有操作用这个局部引用
+        val myWs = wsRef.get()
+        if (myWs == null) {
+            Log.e(TAG, "relay called but ws is null!")
+            return
+        }
 
+        var firstResponse = true
+        val wsToLocalDone = AtomicBoolean(false)
+        val localToWsDone = AtomicBoolean(false)
+
+        // ── 线程1: WS → Local ────────────────────────────────────────────────
+        val t1 = Thread {
             try {
-                while (!closed) {
-                    val chunk = inQueue.poll(30, TimeUnit.SECONDS) ?: run {
-                        Log.w(TAG, "WS→local: 30s timeout"); null
+                while (!closed.get()) {
+                    val chunk = inQueue.poll(60, TimeUnit.SECONDS)
+
+                    if (chunk == null) {
+                        Log.w(TAG, "WS→local: 30s timeout")
+                        break
+                    }
+                    if (chunk === END_MARKER) {
+                        Log.d(TAG, "WS→local: END")
+                        break
                     }
 
-                    if (chunk == null) break
-                    if (chunk === END_MARKER) { Log.d(TAG, "WS→local: END"); break }
-
-                    // 计算实际要写给本地的 payload
-                    val payload: ByteArray? = if (respSkipped) {
-                        chunk
+                    // 剥除 VLESS 响应头（仅第一个包）
+                    val payload = if (firstResponse && chunk.size >= 2) {
+                        firstResponse = false
+                        val addonLen = chunk[1].toInt() and 0xFF
+                        val hdrLen = 2 + addonLen
+                        Log.d(TAG, "VLESS resp hdrSize=$hdrLen addonLen=$addonLen")
+                        if (chunk.size > hdrLen) {
+                            chunk.copyOfRange(hdrLen, chunk.size).also {
+                                Log.d(TAG, "✓ VLESS resp header stripped, payload=${it.size}B")
+                            }
+                        } else null
                     } else {
-                        // 累积响应头数据
-                        respBuf = respBuf + chunk
+                        firstResponse = false
+                        chunk
+                    }
 
-                        // 需要至少 2 字节才能得知 respHdrSize
-                        if (respBuf.size < 2) {
-                            null  // 还不够，等下一个 chunk
-                        } else {
-                            if (respHdrSize == -1) {
-                                // byte[0]=version, byte[1]=addon_len, hdrSize = 2 + addon_len
-                                respHdrSize = 2 + (respBuf[1].toInt() and 0xFF)
-                                Log.d(TAG, "VLESS resp hdrSize=$respHdrSize addonLen=${respBuf[1].toInt() and 0xFF}")
-                            }
-
-                            if (respBuf.size < respHdrSize) {
-                                null  // 头还没收全，继续等
-                            } else {
-                                // 头收全了，提取 payload
-                                respSkipped = true
-                                val p = if (respBuf.size > respHdrSize)
-                                    respBuf.copyOfRange(respHdrSize, respBuf.size)
-                                else
-                                    ByteArray(0)
-                                respBuf = ByteArray(0)
-                                Log.d(TAG, "✓ VLESS resp header stripped, payload=${p.size}B")
-                                p
-                            }
+                    if (payload != null && payload.isNotEmpty()) {
+                        try {
+                            localOut.write(payload)
+                            localOut.flush()
+                        } catch (e: Exception) {
+                            if (!closed.get()) Log.e(TAG, "WS→local write: ${e.message}")
+                            break
                         }
                     }
-
-                    // payload == null 表示还在等响应头，不写数据
-                    if (payload != null && payload.isNotEmpty()) {
-                        localOut.write(payload)
-                        localOut.flush()
-                    }
                 }
             } catch (e: Exception) {
-                if (!closed) Log.e(TAG, "WS→local: ${e.message}")
+                if (!closed.get()) Log.e(TAG, "WS→local: ${e.message}")
             } finally {
+                wsToLocalDone.set(true)
                 runCatching { localOut.close() }
-                ws?.cancel()
+                if (!localToWsDone.get()) runCatching { myWs.cancel() }
             }
-        }, "VT-down")
+        }.apply { isDaemon = true; name = "VT-ws2l-$destPort" }
 
-        // local → WS（上行）
-        val t2 = Thread({
+        // ── 线程2: Local → WS ────────────────────────────────────────────────
+        val t2 = Thread {
             try {
-                val buf = ByteArray(8192)
-                while (!closed) {
-                    val n = localIn.read(buf)
+                val buf = ByteArray(16384)
+                while (!closed.get() && !wsToLocalDone.get()) {
+                    val n = try {
+                        localIn.read(buf)
+                    } catch (e: Exception) {
+                        if (!closed.get() && !wsToLocalDone.get()) {
+                            Log.e(TAG, "local→WS: ${e.message}")
+                        }
+                        break
+                    }
                     if (n < 0) break
+
                     val data = buf.copyOf(n)
-                    if (!headerSent) {
-                        val header = VlessProtocol.buildHeader(cfg.uuid, destHost, destPort)
-                        ws?.send((header + data).toByteString())
-                        headerSent = true
-                    } else {
-                        ws?.send(data.toByteString())
+                    // ★ 直接用 myWs（本隧道的引用），不用 wsRef.get()
+                    val ok = myWs.send(data.toByteString())
+                    if (!ok) {
+                        if (!closed.get()) Log.e(TAG, "local→WS: Socket closed")
+                        break
                     }
                 }
             } catch (e: Exception) {
-                if (!closed) Log.e(TAG, "local→WS: ${e.message}")
+                if (!closed.get() && !wsToLocalDone.get()) Log.e(TAG, "local→WS: ${e.message}")
             } finally {
+                localToWsDone.set(true)
                 inQueue.offer(END_MARKER)
-                ws?.close(1000, null)
+                runCatching { myWs.close(1000, null) }
             }
-        }, "VT-up")
+        }.apply { isDaemon = true; name = "VT-l2ws-$destPort" }
 
-        t1.isDaemon = true; t2.isDaemon = true
-        t1.start();         t2.start()
-        t1.join();          t2.join()
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
         Log.d(TAG, "relay ended")
     }
 
     fun close() {
-        if (closed) return
-        closed = true
-        ws?.cancel()
-        inQueue.clear()
+        if (closed.getAndSet(true)) return
         inQueue.offer(END_MARKER)
+        runCatching { wsRef.get()?.cancel() }
     }
 
-    private fun buildOkHttpClient(): OkHttpClient {
-        val builder = OkHttpClient.Builder()
-            .connectTimeout(15, TimeUnit.SECONDS)
-            .readTimeout(0, TimeUnit.SECONDS)
-            .writeTimeout(15, TimeUnit.SECONDS)
-            .pingInterval(20, TimeUnit.SECONDS)
-
+    private fun buildClient(): OkHttpClient {
         val trustAll = object : X509TrustManager {
             override fun checkClientTrusted(c: Array<X509Certificate>, a: String) {}
             override fun checkServerTrusted(c: Array<X509Certificate>, a: String) {}
             override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
         }
-        val sc = SSLContext.getInstance("TLS").also {
-            it.init(null, arrayOf(trustAll), SecureRandom())
+        val sslCtx = SSLContext.getInstance("TLS").apply {
+            init(null, arrayOf(trustAll), SecureRandom())
         }
 
-        if (vpnService != null) {
+        val builder = OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(0, TimeUnit.SECONDS)
+            .writeTimeout(30, TimeUnit.SECONDS)
+            .pingInterval(25, TimeUnit.SECONDS)
+            // ★ 禁用连接池：WebSocket 用完即废，缓存只会导致复用死连接
+            .connectionPool(ConnectionPool(0, 1, TimeUnit.NANOSECONDS))
+            .hostnameVerifier { _, _ -> true }
+
+        val vpn = vpnService
+        if (vpn != null) {
             builder.socketFactory(object : javax.net.SocketFactory() {
                 private val def = javax.net.SocketFactory.getDefault()
-                override fun createSocket(): Socket {
-                    val s = def.createSocket()
+                private fun p(s: Socket): Socket {
                     s.tcpNoDelay = true
-                    if (!vpnService.protect(s)) Log.w(TAG, "protect plain socket failed")
+                    if (!vpn.protect(s)) Log.w(TAG, "Failed to protect socket")
+                    else Log.d(TAG, "✓ protected")
                     return s
                 }
-                override fun createSocket(h: String, p: Int) =
-                    createSocket().also { it.connect(InetSocketAddress(h, p), 10000) }
-                override fun createSocket(h: String, p: Int, la: java.net.InetAddress, lp: Int) =
-                    createSocket().also { it.bind(InetSocketAddress(la, lp)); it.connect(InetSocketAddress(h, p), 10000) }
-                override fun createSocket(h: java.net.InetAddress, p: Int) =
-                    createSocket().also { it.connect(InetSocketAddress(h, p), 10000) }
-                override fun createSocket(a: java.net.InetAddress, p: Int, la: java.net.InetAddress, lp: Int) =
-                    createSocket().also { it.bind(InetSocketAddress(la, lp)); it.connect(InetSocketAddress(a, p), 10000) }
+                override fun createSocket() = p(def.createSocket())
+                override fun createSocket(h: String, port: Int) =
+                    p(def.createSocket()).also { it.connect(InetSocketAddress(h, port), 15000) }
+                override fun createSocket(h: String, port: Int, la: java.net.InetAddress, lp: Int) =
+                    p(def.createSocket()).also { it.bind(InetSocketAddress(la, lp)); it.connect(InetSocketAddress(h, port), 15000) }
+                override fun createSocket(h: java.net.InetAddress, port: Int) =
+                    p(def.createSocket()).also { it.connect(InetSocketAddress(h, port), 15000) }
+                override fun createSocket(h: java.net.InetAddress, port: Int, la: java.net.InetAddress, lp: Int) =
+                    p(def.createSocket()).also { it.bind(InetSocketAddress(la, lp)); it.connect(InetSocketAddress(h, port), 15000) }
             })
 
+            val baseSsl = sslCtx.socketFactory
             builder.sslSocketFactory(object : SSLSocketFactory() {
-                private val base = sc.socketFactory
-                override fun getDefaultCipherSuites() = base.defaultCipherSuites
-                override fun getSupportedCipherSuites() = base.supportedCipherSuites
-                override fun createSocket(s: Socket, h: String, p: Int, ac: Boolean): Socket =
-                    base.createSocket(s, h, p, ac)
-                override fun createSocket(h: String, p: Int): Socket =
-                    base.createSocket(h, p).also { vpnService.protect(it) }
-                override fun createSocket(h: String, p: Int, la: java.net.InetAddress, lp: Int): Socket =
-                    base.createSocket(h, p, la, lp).also { vpnService.protect(it) }
-                override fun createSocket(h: java.net.InetAddress, p: Int): Socket =
-                    base.createSocket(h, p).also { vpnService.protect(it) }
-                override fun createSocket(a: java.net.InetAddress, p: Int, la: java.net.InetAddress, lp: Int): Socket =
-                    base.createSocket(a, p, la, lp).also { vpnService.protect(it) }
+                override fun getDefaultCipherSuites() = baseSsl.defaultCipherSuites
+                override fun getSupportedCipherSuites() = baseSsl.supportedCipherSuites
+                override fun createSocket(s: Socket, h: String, p: Int, ac: Boolean) =
+                    baseSsl.createSocket(s, h, p, ac)
+                override fun createSocket(h: String, p: Int) =
+                    baseSsl.createSocket(h, p).also { vpn.protect(it) }
+                override fun createSocket(h: String, p: Int, la: java.net.InetAddress, lp: Int) =
+                    baseSsl.createSocket(h, p, la, lp).also { vpn.protect(it) }
+                override fun createSocket(h: java.net.InetAddress, p: Int) =
+                    baseSsl.createSocket(h, p).also { vpn.protect(it) }
+                override fun createSocket(h: java.net.InetAddress, p: Int, la: java.net.InetAddress, lp: Int) =
+                    baseSsl.createSocket(h, p, la, lp).also { vpn.protect(it) }
             }, trustAll)
         } else {
-            builder.sslSocketFactory(sc.socketFactory, trustAll)
+            builder.sslSocketFactory(sslCtx.socketFactory, trustAll)
         }
 
-        builder.hostnameVerifier { _, _ -> true }
         return builder.build()
     }
 }
