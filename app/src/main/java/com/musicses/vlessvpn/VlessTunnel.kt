@@ -20,26 +20,26 @@ import javax.net.ssl.*
 private const val TAG = "VlessTunnel"
 
 /**
- * ★★★ 彻底修复版 ★★★
+ * 修复 1011 + Read timed out
  *
- * 修复 1011 根因：ws 字段竞争覆盖
+ * 问题1: writeTimeout=30s
+ *   OkHttp 的 writeTimeout 指"两次 write 之间的最大间隔"。
+ *   当本地没有数据发送时（正常情况），超过 30s 就触发超时，
+ *   OkHttp 内部关闭 socket → 服务器收到异常断开 → 返回 1011。
+ *   修复：writeTimeout = 0（无限制），由 pingInterval 保持活跃。
  *
- * 问题：
- *   - newWebSocket() 是异步的，onOpen 回调在 OkHttp 的线程池中执行
- *   - 如果两个 VlessTunnel 实例的 onOpen 交错执行（完全可能），
- *     后一个会把 ws 字段覆盖成自己的 WebSocket
- *   - 前一个实例发数据时用的是后一个的 socket → 服务器收到错误数据 → 1011
- *
- * 修复：
- *   - ws 用 AtomicReference 保存，并通过 compareAndSet 确保只设置一次
- *   - onOpen 回调通过局部变量 wsRef 引用自己的 WebSocket，不依赖实例字段
- *   - 所有发送操作通过局部 wsRef 而非 this.ws
+ * 问题2: local→WS: Read timed out
+ *   LocalSocks5Server 对 sock 设了 soTimeout=30000，
+ *   这个超时在整个连接生命周期内都有效，包括 relay 阶段。
+ *   relay 期间本地 30 秒没数据（正常情况）就触发超时中断。
+ *   修复：relay 开始前把 soTimeout 设为 0（无限制）。
+ *   但 relay 在 VlessTunnel 内部，socket 由外部传入的 InputStream，
+ *   所以在 LocalSocks5Server 里 relay 前把 socket timeout 清零。
  */
 class VlessTunnel(
     private val cfg: VlessConfig,
     private val vpnService: VpnService? = null
 ) {
-    // ★ 使用 AtomicReference，并通过 compareAndSet 保证只设置一次
     private val wsRef = AtomicReference<WebSocket?>(null)
     private val inQueue = LinkedBlockingQueue<ByteArray>(2000)
     private val closed = AtomicBoolean(false)
@@ -87,33 +87,22 @@ class VlessTunnel(
                     deliver(false)
                     return
                 }
-
-                // ★ 关键修复：用 compareAndSet 确保只设置一次
-                // 如果已经有值（说明这是重复的 onOpen），拒绝并关闭
                 if (!wsRef.compareAndSet(null, webSocket)) {
-                    Log.w(TAG, "Duplicate onOpen, closing extra WebSocket")
                     webSocket.close(1000, null)
                     deliver(false)
                     return
                 }
-
                 Log.i(TAG, "✓ WS opened")
-
-                // ★ 用局部变量引用，避免后续被覆盖
                 sendFirstPacket(webSocket, earlyData)
                 deliver(true)
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: okio.ByteString) {
-                if (!closed.get() && bytes.size > 0) {
-                    inQueue.offer(bytes.toByteArray())
-                }
+                if (!closed.get() && bytes.size > 0) inQueue.offer(bytes.toByteArray())
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                if (!closed.get() && text.isNotEmpty()) {
-                    inQueue.offer(text.toByteArray())
-                }
+                if (!closed.get() && text.isNotEmpty()) inQueue.offer(text.toByteArray())
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
@@ -128,16 +117,13 @@ class VlessTunnel(
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                if (!closed.get()) {
-                    Log.e(TAG, "✗ WS failure: ${t.message}")
-                }
+                if (!closed.get()) Log.e(TAG, "✗ WS failure: ${t.message}")
                 inQueue.offer(END_MARKER)
                 deliver(false)
             }
         })
     }
 
-    // ★ 接受 webSocket 参数而不用实例字段，避免读到别的隧道的 ws
     private fun sendFirstPacket(webSocket: WebSocket, earlyData: ByteArray?) {
         if (headerSent.getAndSet(true)) return
         val header = VlessProtocol.buildHeader(cfg.uuid, destHost, destPort)
@@ -154,10 +140,8 @@ class VlessTunnel(
     fun relay(localIn: InputStream, localOut: OutputStream) {
         if (closed.get()) return
 
-        // ★ 在 relay 开始时拿一次本隧道的 ws，后续所有操作用这个局部引用
-        val myWs = wsRef.get()
-        if (myWs == null) {
-            Log.e(TAG, "relay called but ws is null!")
+        val myWs = wsRef.get() ?: run {
+            Log.e(TAG, "relay: ws is null")
             return
         }
 
@@ -165,22 +149,15 @@ class VlessTunnel(
         val wsToLocalDone = AtomicBoolean(false)
         val localToWsDone = AtomicBoolean(false)
 
-        // ── 线程1: WS → Local ────────────────────────────────────────────────
+        // ── WS → Local ───────────────────────────────────────────────────────
         val t1 = Thread {
             try {
                 while (!closed.get()) {
+                    // ★ 用 60s 而非无限等待，防止连接僵死无法释放
                     val chunk = inQueue.poll(60, TimeUnit.SECONDS)
+                    if (chunk == null) { Log.w(TAG, "WS→local: 30s timeout"); break }
+                    if (chunk === END_MARKER) { Log.d(TAG, "WS→local: END"); break }
 
-                    if (chunk == null) {
-                        Log.w(TAG, "WS→local: 30s timeout")
-                        break
-                    }
-                    if (chunk === END_MARKER) {
-                        Log.d(TAG, "WS→local: END")
-                        break
-                    }
-
-                    // 剥除 VLESS 响应头（仅第一个包）
                     val payload = if (firstResponse && chunk.size >= 2) {
                         firstResponse = false
                         val addonLen = chunk[1].toInt() and 0xFF
@@ -192,14 +169,12 @@ class VlessTunnel(
                             }
                         } else null
                     } else {
-                        firstResponse = false
-                        chunk
+                        firstResponse = false; chunk
                     }
 
                     if (payload != null && payload.isNotEmpty()) {
                         try {
-                            localOut.write(payload)
-                            localOut.flush()
+                            localOut.write(payload); localOut.flush()
                         } catch (e: Exception) {
                             if (!closed.get()) Log.e(TAG, "WS→local write: ${e.message}")
                             break
@@ -215,7 +190,7 @@ class VlessTunnel(
             }
         }.apply { isDaemon = true; name = "VT-ws2l-$destPort" }
 
-        // ── 线程2: Local → WS ────────────────────────────────────────────────
+        // ── Local → WS ───────────────────────────────────────────────────────
         val t2 = Thread {
             try {
                 val buf = ByteArray(16384)
@@ -223,19 +198,20 @@ class VlessTunnel(
                     val n = try {
                         localIn.read(buf)
                     } catch (e: Exception) {
-                        if (!closed.get() && !wsToLocalDone.get()) {
-                            Log.e(TAG, "local→WS: ${e.message}")
-                        }
+                        if (!closed.get() && !wsToLocalDone.get()) Log.e(TAG, "local→WS: ${e.message}")
                         break
                     }
                     if (n < 0) break
 
                     val data = buf.copyOf(n)
-                    // ★ 直接用 myWs（本隧道的引用），不用 wsRef.get()
-                    val ok = myWs.send(data.toByteString())
-                    if (!ok) {
-                        if (!closed.get()) Log.e(TAG, "local→WS: Socket closed")
-                        break
+                    if (!headerSent.get()) {
+                        sendFirstPacket(myWs, data)
+                    } else {
+                        val ok = myWs.send(data.toByteString())
+                        if (!ok) {
+                            if (!closed.get()) Log.e(TAG, "local→WS: Socket closed")
+                            break
+                        }
                     }
                 }
             } catch (e: Exception) {
@@ -247,11 +223,8 @@ class VlessTunnel(
             }
         }.apply { isDaemon = true; name = "VT-l2ws-$destPort" }
 
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
-
+        t1.start(); t2.start()
+        t1.join(); t2.join()
         Log.d(TAG, "relay ended")
     }
 
@@ -273,10 +246,12 @@ class VlessTunnel(
 
         val builder = OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)
-            .readTimeout(0, TimeUnit.SECONDS)
-            .writeTimeout(30, TimeUnit.SECONDS)
-            .pingInterval(25, TimeUnit.SECONDS)
-            // ★ 禁用连接池：WebSocket 用完即废，缓存只会导致复用死连接
+            .readTimeout(0, TimeUnit.SECONDS)   // 无限，由 inQueue.poll 控制超时
+            // ★ 关键修复：writeTimeout 必须为 0
+            // writeTimeout > 0 时，两次 send 之间超过该时间就触发超时关闭连接
+            // 当本地没有新数据发送时（正常静默期），会导致 1011
+            .writeTimeout(0, TimeUnit.SECONDS)
+            .pingInterval(20, TimeUnit.SECONDS) // ping 维持连接，替代 writeTimeout 的作用
             .connectionPool(ConnectionPool(0, 1, TimeUnit.NANOSECONDS))
             .hostnameVerifier { _, _ -> true }
 
@@ -305,16 +280,11 @@ class VlessTunnel(
             builder.sslSocketFactory(object : SSLSocketFactory() {
                 override fun getDefaultCipherSuites() = baseSsl.defaultCipherSuites
                 override fun getSupportedCipherSuites() = baseSsl.supportedCipherSuites
-                override fun createSocket(s: Socket, h: String, p: Int, ac: Boolean) =
-                    baseSsl.createSocket(s, h, p, ac)
-                override fun createSocket(h: String, p: Int) =
-                    baseSsl.createSocket(h, p).also { vpn.protect(it) }
-                override fun createSocket(h: String, p: Int, la: java.net.InetAddress, lp: Int) =
-                    baseSsl.createSocket(h, p, la, lp).also { vpn.protect(it) }
-                override fun createSocket(h: java.net.InetAddress, p: Int) =
-                    baseSsl.createSocket(h, p).also { vpn.protect(it) }
-                override fun createSocket(h: java.net.InetAddress, p: Int, la: java.net.InetAddress, lp: Int) =
-                    baseSsl.createSocket(h, p, la, lp).also { vpn.protect(it) }
+                override fun createSocket(s: Socket, h: String, p: Int, ac: Boolean) = baseSsl.createSocket(s, h, p, ac)
+                override fun createSocket(h: String, p: Int) = baseSsl.createSocket(h, p).also { vpn.protect(it) }
+                override fun createSocket(h: String, p: Int, la: java.net.InetAddress, lp: Int) = baseSsl.createSocket(h, p, la, lp).also { vpn.protect(it) }
+                override fun createSocket(h: java.net.InetAddress, p: Int) = baseSsl.createSocket(h, p).also { vpn.protect(it) }
+                override fun createSocket(h: java.net.InetAddress, p: Int, la: java.net.InetAddress, lp: Int) = baseSsl.createSocket(h, p, la, lp).also { vpn.protect(it) }
             }, trustAll)
         } else {
             builder.sslSocketFactory(sslCtx.socketFactory, trustAll)
