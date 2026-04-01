@@ -1,0 +1,8 @@
+gradle-wrapper.jar 需要手动放置。
+
+方法：
+1. 用 Android Studio 打开项目，它会自动下载
+2. 或从本地已有项目复制：
+   cp ~/.gradle/wrapper/dists/gradle-8.7-bin/*/gradle-8.7/lib/gradle-launcher-8.7.jar gradle-wrapper.jar
+3. 或手动下载：
+   https://raw.githubusercontent.com/gradle/gradle/v8.7.0/gradle/wrapper/gradle-wrapper.jar

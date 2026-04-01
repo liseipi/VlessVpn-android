@@ -1,0 +1,122 @@
+[
+    {
+        "merged": "com.vlessvpn.app-debug-36:/mipmap-xxhdpi_ic_launcher_round.png.flat",
+        "source": "com.vlessvpn.app-main-38:/mipmap-xxhdpi/ic_launcher_round.png"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/drawable_ic_arrow_right.xml.flat",
+        "source": "com.vlessvpn.app-main-38:/drawable/ic_arrow_right.xml"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/layout_item_config.xml.flat",
+        "source": "com.vlessvpn.app-main-38:/layout/item_config.xml"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/mipmap-mdpi_ic_launcher_round.png.flat",
+        "source": "com.vlessvpn.app-main-38:/mipmap-mdpi/ic_launcher_round.png"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/drawable_ic_check_circle.xml.flat",
+        "source": "com.vlessvpn.app-main-38:/drawable/ic_check_circle.xml"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/mipmap-xxxhdpi_ic_launcher_round.png.flat",
+        "source": "com.vlessvpn.app-main-38:/mipmap-xxxhdpi/ic_launcher_round.png"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/mipmap-anydpi-v26_ic_launcher.xml.flat",
+        "source": "com.vlessvpn.app-main-38:/mipmap-anydpi-v26/ic_launcher.xml"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/drawable_icon_bg_round.xml.flat",
+        "source": "com.vlessvpn.app-main-38:/drawable/icon_bg_round.xml"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/mipmap-mdpi_ic_launcher.png.flat",
+        "source": "com.vlessvpn.app-main-38:/mipmap-mdpi/ic_launcher.png"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/layout_activity_add_config.xml.flat",
+        "source": "com.vlessvpn.app-main-38:/layout/activity_add_config.xml"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/mipmap-xhdpi_ic_launcher.png.flat",
+        "source": "com.vlessvpn.app-main-38:/mipmap-xhdpi/ic_launcher.png"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/drawable_ic_vpn.xml.flat",
+        "source": "com.vlessvpn.app-main-38:/drawable/ic_vpn.xml"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/drawable_ic_launcher_background.xml.flat",
+        "source": "com.vlessvpn.app-main-38:/drawable/ic_launcher_background.xml"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/drawable_ic_stop.xml.flat",
+        "source": "com.vlessvpn.app-main-38:/drawable/ic_stop.xml"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/drawable_ripple_animation.xml.flat",
+        "source": "com.vlessvpn.app-main-38:/drawable/ripple_animation.xml"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/drawable_ic_server.xml.flat",
+        "source": "com.vlessvpn.app-main-38:/drawable/ic_server.xml"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/mipmap-anydpi-v26_ic_launcher_round.xml.flat",
+        "source": "com.vlessvpn.app-main-38:/mipmap-anydpi-v26/ic_launcher_round.xml"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/layout_activity_main.xml.flat",
+        "source": "com.vlessvpn.app-main-38:/layout/activity_main.xml"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/mipmap-xxhdpi_ic_launcher.png.flat",
+        "source": "com.vlessvpn.app-main-38:/mipmap-xxhdpi/ic_launcher.png"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/drawable_ic_vpn_connecting.xml.flat",
+        "source": "com.vlessvpn.app-main-38:/drawable/ic_vpn_connecting.xml"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/menu_main_menu.xml.flat",
+        "source": "com.vlessvpn.app-main-38:/menu/main_menu.xml"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/drawable_ic_add.xml.flat",
+        "source": "com.vlessvpn.app-main-38:/drawable/ic_add.xml"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/mipmap-xxxhdpi_ic_launcher.png.flat",
+        "source": "com.vlessvpn.app-main-38:/mipmap-xxxhdpi/ic_launcher.png"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/mipmap-xhdpi_ic_launcher_round.png.flat",
+        "source": "com.vlessvpn.app-main-38:/mipmap-xhdpi/ic_launcher_round.png"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/drawable_ic_vpn_off.xml.flat",
+        "source": "com.vlessvpn.app-main-38:/drawable/ic_vpn_off.xml"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/layout_activity_config_list.xml.flat",
+        "source": "com.vlessvpn.app-main-38:/layout/activity_config_list.xml"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/drawable_ic_launcher_foreground.xml.flat",
+        "source": "com.vlessvpn.app-main-38:/drawable/ic_launcher_foreground.xml"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/drawable_ic_vpn_on.xml.flat",
+        "source": "com.vlessvpn.app-main-38:/drawable/ic_vpn_on.xml"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/mipmap-hdpi_ic_launcher_round.png.flat",
+        "source": "com.vlessvpn.app-main-38:/mipmap-hdpi/ic_launcher_round.png"
+    },
+    {
+        "merged": "com.vlessvpn.app-debug-36:/mipmap-hdpi_ic_launcher.png.flat",
+        "source": "com.vlessvpn.app-main-38:/mipmap-hdpi/ic_launcher.png"
+    }
+]

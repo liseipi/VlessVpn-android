@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="accent">#5B8DEF</color>
+    <color name="accent_dark">#3A6FD8</color>
+    <color name="bg_primary">#0F1117</color>
+    <color name="black">#FF000000</color>
+    <color name="card_bg">#1A1D2E</color>
+    <color name="divider">#2A2D3E</color>
+    <color name="error">#EF5350</color>
+    <color name="purple_200">#FFBB86FC</color>
+    <color name="purple_500">#FF6200EE</color>
+    <color name="purple_700">#FF3700B3</color>
+    <color name="status_connected">#4CAF50</color>
+    <color name="status_connecting">#FFB74D</color>
+    <color name="status_disconnected">#7B7F96</color>
+    <color name="status_error">#EF5350</color>
+    <color name="teal_200">#FF03DAC5</color>
+    <color name="teal_700">#FF018786</color>
+    <color name="text_primary">#EAEDF3</color>
+    <color name="text_secondary">#7B7F96</color>
+    <color name="white">#FFFFFFFF</color>
+    <string name="app_name">VlessVPN</string>
+    <style name="CardViewStyle" parent="Widget.MaterialComponents.CardView">
+        <item name="cardBackgroundColor">@color/card_bg</item>
+        <item name="cardElevation">0dp</item>
+    </style>
+    <style name="Theme.VlessVPN" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/accent</item>
+        <item name="colorPrimaryVariant">@color/accent_dark</item>
+        <item name="colorOnPrimary">@color/white</item>
+        <item name="colorSecondary">@color/accent</item>
+        <item name="colorSecondaryVariant">@color/accent_dark</item>
+        <item name="colorOnSecondary">@color/white</item>
+        <item name="android:windowBackground">@color/bg_primary</item>
+        <item name="android:statusBarColor">@color/bg_primary</item>
+        <item name="android:navigationBarColor">@color/bg_primary</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="materialCardViewStyle">@style/CardViewStyle</item>
+    </style>
+    <style name="ToolbarTitle" parent="TextAppearance.Widget.AppCompat.Toolbar.Title">
+        <item name="android:textSize">18sp</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:textColor">@color/text_primary</item>
+    </style>
+</resources>

@@ -1,0 +1,1 @@
+-keep class com.musicses.vlessvpn.Tun2Socks { *; }
