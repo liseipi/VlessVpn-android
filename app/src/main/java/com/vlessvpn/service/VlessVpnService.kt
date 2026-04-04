@@ -38,6 +38,7 @@ class VlessVpnService : VpnService() {
         private const val VPN_MTU       = 1500
 
         @Volatile var isRunning = false
+    @Volatile private var isStarting = false
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
@@ -86,11 +87,12 @@ class VlessVpnService : VpnService() {
     // ── 启动 VPN ──────────────────────────────────────────────────────────────
 
     private fun startVpn(config: VlessConfig) {
-        if (isRunning) {
-            Log.w(TAG, "VPN already running")
+        if (isRunning || isStarting) {
+            Log.w(TAG, "VPN already running or starting")
             return
         }
 
+        isStarting = true
         VpnStateManager.setState(VpnStateManager.State.CONNECTING)
         startForeground(NOTIFICATION_ID, buildNotification("正在连接...", config.displayName()))
         currentConfig = config
@@ -104,6 +106,7 @@ class VlessVpnService : VpnService() {
                 localProxy = LocalProxyServer(config, socksPort).also { it.start() }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to start local proxy: ${e.message}")
+                isStarting = false
                 VpnStateManager.setState(VpnStateManager.State.ERROR, "代理启动失败: ${e.message}")
                 stopSelf()
                 return@thread
@@ -139,12 +142,15 @@ class VlessVpnService : VpnService() {
             if (vpnInterface == null) {
                 Log.e(TAG, "Failed to establish VPN interface")
                 localProxy?.stop()
+                localProxy = null
+                isStarting = false
                 VpnStateManager.setState(VpnStateManager.State.ERROR, "VPN 接口创建失败")
                 stopSelf()
                 return@thread
             }
 
             isRunning = true
+            isStarting = false
 
             // 3. 启动 tun2socks（阻塞直到停止）
             tun2socksThread = thread(name = "tun2socks") {
@@ -173,7 +179,7 @@ class VlessVpnService : VpnService() {
     // ── 停止 VPN ──────────────────────────────────────────────────────────────
 
     private fun stopVpn() {
-        if (!isRunning && vpnInterface == null) return
+        if (!isRunning && !isStarting && vpnInterface == null) return
 
         VpnStateManager.setState(VpnStateManager.State.DISCONNECTING)
         Log.i(TAG, "Stopping VPN...")
@@ -192,6 +198,7 @@ class VlessVpnService : VpnService() {
         localProxy = null
 
         isRunning = false
+        isStarting = false
         currentConfig = null
 
         VpnStateManager.setState(VpnStateManager.State.DISCONNECTED)

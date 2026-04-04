@@ -52,25 +52,39 @@ extern "C"
 JNIEXPORT jint JNICALL
 Java_com_musicses_vlessvpn_Tun2Socks_start_1tun2socks(JNIEnv *env, jclass clazz, jobjectArray args) {
     jsize argument_count = env->GetArrayLength(args);
+
+    // 计算所需缓冲区大小
     int c_arguments_size = 0;
     for (int i = 0; i < argument_count; i++) {
-        c_arguments_size += strlen(env->GetStringUTFChars((jstring) env->GetObjectArrayElement(args, i), 0));
-        c_arguments_size++;
+        jstring jstr = (jstring) env->GetObjectArrayElement(args, i);
+        const char *str = env->GetStringUTFChars(jstr, 0);
+        c_arguments_size += strlen(str) + 1;
+        env->ReleaseStringUTFChars(jstr, str);  // 立即释放，避免泄漏
+        env->DeleteLocalRef(jstr);
     }
+
     char *args_buffer = (char *) calloc(c_arguments_size, sizeof(char));
-    char *argv[argument_count];
+    // 使用 malloc 替代 C99 VLA，兼容 C++ 标准
+    char **argv = (char **) malloc(argument_count * sizeof(char *));
+
     char *current_args_position = args_buffer;
     for (int i = 0; i < argument_count; i++) {
-        const char *current_argument = env->GetStringUTFChars((jstring) env->GetObjectArrayElement(args, i), 0);
+        jstring jstr = (jstring) env->GetObjectArrayElement(args, i);
+        const char *current_argument = env->GetStringUTFChars(jstr, 0);
         strncpy(current_args_position, current_argument, strlen(current_argument));
         argv[i] = current_args_position;
         current_args_position += strlen(current_args_position) + 1;
+        env->ReleaseStringUTFChars(jstr, current_argument);  // 释放，避免泄漏
+        env->DeleteLocalRef(jstr);
     }
+
     if (start_redirecting_stdout_stderr() == -1) {
         __android_log_write(ANDROID_LOG_ERROR, ADBTAG, "Couldn't start redirecting stdout/stderr.");
     }
+
     int result = tun2socks_start(argument_count, argv);
     free(args_buffer);
+    free(argv);
     return jint(result);
 }
 

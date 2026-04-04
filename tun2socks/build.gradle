@@ -4,11 +4,14 @@ plugins {
 
 android {
     namespace 'com.musicses.vlessvpn'
-    compileSdk 34
+    compileSdk 36
+
+    // Updated to a newer stable NDK version to fix corrupted download issue
+    ndkVersion "26.1.10909125"
 
     defaultConfig {
         minSdk 21
-        targetSdk 34
+        targetSdk 36
         consumerProguardFiles "consumer-rules.pro"
 
         externalNativeBuild {
@@ -19,7 +22,7 @@ android {
         }
 
         ndk {
-            abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64'
+            abiFilters 'arm64-v8a'
         }
     }
 
@@ -33,16 +36,16 @@ android {
     externalNativeBuild {
         cmake {
             path "src/main/cpp/CMakeLists.txt"
-            version "3.10.2"
+            version "3.22.1"
         }
     }
 
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_1_8
-        targetCompatibility JavaVersion.VERSION_1_8
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
     }
 }
 
 dependencies {
-    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'androidx.appcompat:appcompat:1.7.1'
 }

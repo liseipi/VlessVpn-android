@@ -150,8 +150,8 @@ class LocalProxyServer(
                     tunnelOut.write(vlessHdr)
                     tunnelOut.flush()
 
-                    // 双向中继
-                    relay(inp, out, tunnelIn, tunnelOut)
+                    // 双向中继（传入 client socket，用于解除死锁）
+                    relay(client, inp, out, tunnelIn, tunnelOut)
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "SOCKS5 handler error: ${e.message}")
@@ -413,6 +413,7 @@ class LocalProxyServer(
     // ── 双向中继 (还原 client.js relay，含 VLESS 响应头跳过) ─────────────────
 
     private fun relay(
+        clientSocket: Socket,       // 用于在一端结束时关闭整个 socket，解除另一端的阻塞
         clientIn: InputStream,
         clientOut: OutputStream,
         tunnelIn: InputStream,
@@ -455,8 +456,8 @@ class LocalProxyServer(
                     }
                 }
             } catch (_: Exception) {}
-            // t2c 结束时，关闭 clientOut 通知另一侧
-            try { clientOut.close() } catch (_: Exception) {}
+            // t2c 结束：关闭整个 clientSocket，让 c2t 的 clientIn.read() 收到 EOF
+            try { clientSocket.close() } catch (_: Exception) {}
         }
 
         // 从客户端到隧道
@@ -469,11 +470,10 @@ class LocalProxyServer(
                     tunnelOut.write(buf, 0, n)
                 }
             } catch (_: Exception) {}
-            // c2t 结束时，关闭 tunnelOut 通知隧道侧
+            // c2t 结束：关闭 tunnelOut 通知隧道侧
             try { tunnelOut.close() } catch (_: Exception) {}
         }
 
-        // 等待任意一侧结束，然后关闭两侧让另一侧也退出
         t2c.join()
         c2t.join()
     }
