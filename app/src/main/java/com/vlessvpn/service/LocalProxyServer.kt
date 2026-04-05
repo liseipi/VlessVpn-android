@@ -24,7 +24,7 @@ import kotlin.concurrent.thread
  * 将 tun2socks 发来的 SOCKS5 请求通过 VLESS+WebSocket 隧道转发
  *
  * network: 物理网络引用（VPN 建立前从 ConnectivityManager.activeNetwork 获取），
- *          用于创建 socket 并解析 DNS，确保流量不走 VPN，避免路由循环。
+ *          用于创建 socket，确保流量不走 VPN，避免路由循环。
  * protectSocket: 由 VpnService.protect() 提供，双重保障。
  */
 class LocalProxyServer(
@@ -42,6 +42,10 @@ class LocalProxyServer(
     private val executor: ExecutorService = Executors.newCachedThreadPool()
     @Volatile private var running = false
 
+    // ✅ 关键修复：缓存已解析的服务器 IP，一旦成功就不再重新解析
+    // 用 @Volatile 保证多线程可见性
+    @Volatile private var cachedServerAddress: InetAddress? = null
+
     // 忽略证书验证（与 client.js rejectUnauthorized:false 一致）
     private val sslContext: SSLContext by lazy {
         val trustAll = arrayOf<TrustManager>(object : X509TrustManager {
@@ -52,8 +56,48 @@ class LocalProxyServer(
         SSLContext.getInstance("TLS").also { it.init(null, trustAll, java.security.SecureRandom()) }
     }
 
+    /**
+     * 获取服务器 IP 地址，优先使用缓存。
+     * 强制通过物理网络解析，避免 VPN 建立后 DNS 走隧道造成路由循环。
+     */
+    private fun getServerAddress(): InetAddress {
+        // 已缓存直接返回，不再解析
+        cachedServerAddress?.let { return it }
+
+        val addr: InetAddress = try {
+            if (network != null) {
+                network.getByName(config.serverHost).also {
+                    Log.i(TAG, "Resolved ${config.serverHost} -> ${it.hostAddress} (physical network)")
+                }
+            } else {
+                InetAddress.getByName(config.serverHost).also {
+                    Log.i(TAG, "Resolved ${config.serverHost} -> ${it.hostAddress} (system DNS)")
+                }
+            }
+        } catch (e: Exception) {
+            throw IOException("Cannot resolve server host ${config.serverHost}: ${e.message}", e)
+        }
+
+        // 缓存结果，后续连接直接用 IP，不再触发 DNS
+        cachedServerAddress = addr
+        return addr
+    }
+
     fun start() {
         running = true
+
+        // 后台提前解析，此时 VPN 尚未建立，DNS 走物理网络
+        // 失败了不阻塞启动，等第一次实际连接时再解析
+        thread(name = "proxy-pre-resolve") {
+            // 稍等片刻，让 VPN 接口先建立（避免和 VPN 建立竞争）
+            Thread.sleep(200)
+            try {
+                getServerAddress()
+            } catch (e: Exception) {
+                Log.w(TAG, "Pre-resolution failed, will retry on first connect: ${e.message}")
+            }
+        }
+
         thread(name = "proxy-accept") {
             try {
                 serverSocket = ServerSocket().apply {
@@ -79,6 +123,7 @@ class LocalProxyServer(
 
     fun stop() {
         running = false
+        cachedServerAddress = null  // 清除缓存，下次启动重新解析
         try { serverSocket?.close() } catch (_: Exception) {}
         executor.shutdownNow()
         Log.i(TAG, "Proxy stopped")
@@ -170,7 +215,7 @@ class LocalProxyServer(
                         Log.d(TAG, "Relay finished for $host:$port")
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "Tunnel error for $host:$port : ${e.message}", e)
+                    Log.e(TAG, "Tunnel error for $host:$port : ${e.javaClass.simpleName}: ${e.message}", e)
                 }
 
             } catch (e: Exception) {
@@ -182,20 +227,18 @@ class LocalProxyServer(
     // ── 建立 WebSocket 隧道 ───────────────────────────────────────────────────
 
     private fun openTunnel(block: (socket: Socket, out: OutputStream, inp: InputStream) -> Unit) {
-        // ✅ 关键修复：用物理网络的 socketFactory 创建 socket
-        // network.socketFactory 创建的 socket 的 DNS 解析也走物理网络，不走 VPN
-        // 这样 InetSocketAddress(hostname, port) 的 DNS 解析不会产生路由循环
         val rawSocket: Socket = if (network != null) {
             network.socketFactory.createSocket()
         } else {
             Socket()
         }
 
-        // protect 作为双重保障，防止 network 为 null 时的回退路径
+        // protect 作为双重保障
         protectSocket?.invoke(rawSocket)
 
-        // 现在可以安全地用 hostname 连接，DNS 走物理网络
-        rawSocket.connect(InetSocketAddress(config.serverHost, config.serverPort), 15000)
+        // ✅ 用缓存的 IP 直接连接，不触发任何 DNS 解析，彻底避免路由循环
+        val serverAddr = getServerAddress()
+        rawSocket.connect(InetSocketAddress(serverAddr, config.serverPort), 15000)
         rawSocket.soTimeout = 0
 
         val socket: Socket = if (config.isTls()) {
@@ -203,7 +246,7 @@ class LocalProxyServer(
                 rawSocket, config.serverHost, config.serverPort, true
             ) as SSLSocket
             ssl.enabledProtocols = ssl.supportedProtocols
-            // 设置 SNI，解决 TLS 握手问题
+            // SNI 必须用域名，不能用 IP
             val sniHost = config.sni.takeIf { it.isNotBlank() } ?: config.serverHost
             val sslParameters = ssl.sslParameters
             sslParameters.serverNames = listOf(javax.net.ssl.SNIHostName(sniHost))
@@ -368,7 +411,6 @@ class LocalProxyServer(
         val uuidBytes = config.uuid.replace("-", "")
             .chunked(2).map { it.toInt(16).toByte() }.toByteArray()
 
-        // 判断地址类型：IPv4=1, Domain=2, IPv6=3
         return try {
             val addr = InetAddress.getByName(host)
             val addrBytes = addr.address
@@ -377,12 +419,11 @@ class LocalProxyServer(
                 16 -> 0x03  // IPv6
                 else -> throw IllegalArgumentException("Unknown address type")
             }
-            // version(1) + uuid(16) + addonLen(1) + cmd(1) + port(2) + atype(1) + addr
             val buf = ByteBuffer.allocate(22 + addrBytes.size)
-            buf.put(0x00)        // version
-            buf.put(uuidBytes)   // uuid (16 bytes)
-            buf.put(0x00)        // addon length
-            buf.put(0x01)        // command: connect (TCP)
+            buf.put(0x00)
+            buf.put(uuidBytes)
+            buf.put(0x00)
+            buf.put(0x01)
             buf.putShort(port.toShort())
             buf.put(atype)
             buf.put(addrBytes)
@@ -390,14 +431,13 @@ class LocalProxyServer(
         } catch (e: Exception) {
             // domain
             val hostBytes = host.toByteArray(Charsets.UTF_8)
-            // version(1) + uuid(16) + addonLen(1) + cmd(1) + port(2) + atype(1) + len(1) + host
             val buf = ByteBuffer.allocate(22 + 1 + hostBytes.size)
-            buf.put(0x00)        // version
-            buf.put(uuidBytes)   // uuid (16 bytes)
-            buf.put(0x00)        // addon length
-            buf.put(0x01)        // command: connect (TCP)
+            buf.put(0x00)
+            buf.put(uuidBytes)
+            buf.put(0x00)
+            buf.put(0x01)
             buf.putShort(port.toShort())
-            buf.put(0x02)        // atype: domain
+            buf.put(0x02)
             buf.put(hostBytes.size.toByte())
             buf.put(hostBytes)
             buf.array()
@@ -425,8 +465,7 @@ class LocalProxyServer(
 
         val t2 = thread(name = "relay-down") {
             try {
-                // VLESS 响应头解析（对齐 client.js relay() onMsg 逻辑）：
-                // byte[0]=version, byte[1]=addon_len, 总头长 = 2 + addon_len
+                // VLESS 响应头：byte[0]=version, byte[1]=addon_len, 总长 = 2 + addon_len
                 var respBuf = ByteArray(0)
                 var respSkipped = false
                 var respHdrSize = -1
@@ -447,6 +486,7 @@ class LocalProxyServer(
 
                     if (respHdrSize == -1) {
                         respHdrSize = 2 + (respBuf[1].toInt() and 0xFF)
+                        Log.d(TAG, "VLESS resp: version=${respBuf[0]}, addon=${respBuf[1].toInt() and 0xFF}, skip=$respHdrSize")
                     }
                     if (respBuf.size < respHdrSize) continue
 
