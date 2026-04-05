@@ -7,7 +7,7 @@ android {
     compileSdk 36
 
     // Updated to a newer stable NDK version to fix corrupted download issue
-    ndkVersion "26.1.10909125"
+    ndkVersion "30.0.14904198"
 
     defaultConfig {
         minSdk 21

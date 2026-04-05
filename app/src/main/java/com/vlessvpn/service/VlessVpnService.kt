@@ -155,12 +155,15 @@ class VlessVpnService : VpnService() {
                 .setSession("VlessVPN")
                 .setMtu(VPN_MTU)
                 .addAddress(VPN_ADDRESS, 30)
-                .addDnsServer("1.1.1.1")
-                .addDnsServer("8.8.8.8")
                 .addRoute("0.0.0.0", 0)
                 .addAddress(VPN_ADDRESS6, 126)
-                .addDnsServer("2606:4700:4700::1111")
                 .addRoute("::", 0)
+            
+            // 设置 DNS 服务器，Android 8.0+ 需要使用 setUnderlyingNetworks 来避免 DNS 路由循环
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+                builder.addDnsServer("1.1.1.1")
+                builder.addDnsServer("8.8.8.8")
+            }
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 builder.setMetered(false)
@@ -188,6 +191,7 @@ class VlessVpnService : VpnService() {
             isStarting = false
 
             // 3. 启动 tun2socks（阻塞直到停止）
+            // 启用 UDP 转发以支持 DNS 等 UDP 流量
             tun2socksThread = thread(name = "tun2socks") {
                 Log.i(TAG, "Starting tun2socks, SOCKS5 at 127.0.0.1:$socksPort")
                 val result = Tun2Socks.startTun2Socks(
@@ -199,7 +203,7 @@ class VlessVpnService : VpnService() {
                     VPN_ROUTE,
                     VPN_ROUTE6,
                     VPN_NETMASK,
-                    false
+                    true  // 启用 UDP 转发
                 )
                 Log.i(TAG, "tun2socks stopped, result=$result")
                 isRunning = false

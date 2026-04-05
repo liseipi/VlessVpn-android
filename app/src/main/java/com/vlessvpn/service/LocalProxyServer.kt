@@ -159,14 +159,18 @@ class LocalProxyServer(
 
                 // 6. 建立 WebSocket 隧道并中继
                 try {
-                    openTunnel { _, tunnelOut, tunnelIn ->
+                    Log.d(TAG, "Opening tunnel to $host:$port via ${config.serverHost}:${config.serverPort}")
+                    openTunnel { socket, tunnelOut, tunnelIn ->
                         val vlessHdr = buildVlessHeader(host, port)
+                        Log.d(TAG, "Sending VLESS header for $host:$port, header size=${vlessHdr.size}")
                         tunnelOut.write(vlessHdr)
                         tunnelOut.flush()
+                        Log.d(TAG, "Starting relay for $host:$port")
                         relay(client, inp, out, tunnelIn, tunnelOut)
+                        Log.d(TAG, "Relay finished for $host:$port")
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "Tunnel error for $host:$port : ${e.message}")
+                    Log.e(TAG, "Tunnel error for $host:$port : ${e.message}", e)
                 }
 
             } catch (e: Exception) {
@@ -199,6 +203,11 @@ class LocalProxyServer(
                 rawSocket, config.serverHost, config.serverPort, true
             ) as SSLSocket
             ssl.enabledProtocols = ssl.supportedProtocols
+            // 设置 SNI，解决 TLS 握手问题
+            val sniHost = config.sni.takeIf { it.isNotBlank() } ?: config.serverHost
+            val sslParameters = ssl.sslParameters
+            sslParameters.serverNames = listOf(javax.net.ssl.SNIHostName(sniHost))
+            ssl.sslParameters = sslParameters
             ssl.startHandshake()
             ssl
         } else {
@@ -359,18 +368,21 @@ class LocalProxyServer(
         val uuidBytes = config.uuid.replace("-", "")
             .chunked(2).map { it.toInt(16).toByte() }.toByteArray()
 
-        // 判断地址类型，与 client.js 逻辑完全一致：
-        // IPv4 → atype=1, IPv6 → atype=3(16字节), domain → atype=2
+        // 判断地址类型：IPv4=1, Domain=2, IPv6=3
         return try {
             val addr = InetAddress.getByName(host)
             val addrBytes = addr.address
-            val atype: Byte = if (addrBytes.size == 4) 0x01 else 0x03
-            // fixed: version(1) + uuid(16) + addonLen(1) + cmd(1) + port(2) + atype(1) = 22
+            val atype: Byte = when (addrBytes.size) {
+                4 -> 0x01   // IPv4
+                16 -> 0x03  // IPv6
+                else -> throw IllegalArgumentException("Unknown address type")
+            }
+            // version(1) + uuid(16) + addonLen(1) + cmd(1) + port(2) + atype(1) + addr
             val buf = ByteBuffer.allocate(22 + addrBytes.size)
             buf.put(0x00)        // version
-            buf.put(uuidBytes)   // uuid
+            buf.put(uuidBytes)   // uuid (16 bytes)
             buf.put(0x00)        // addon length
-            buf.put(0x01)        // command: connect
+            buf.put(0x01)        // command: connect (TCP)
             buf.putShort(port.toShort())
             buf.put(atype)
             buf.put(addrBytes)
@@ -378,11 +390,12 @@ class LocalProxyServer(
         } catch (e: Exception) {
             // domain
             val hostBytes = host.toByteArray(Charsets.UTF_8)
+            // version(1) + uuid(16) + addonLen(1) + cmd(1) + port(2) + atype(1) + len(1) + host
             val buf = ByteBuffer.allocate(22 + 1 + hostBytes.size)
             buf.put(0x00)        // version
-            buf.put(uuidBytes)   // uuid
+            buf.put(uuidBytes)   // uuid (16 bytes)
             buf.put(0x00)        // addon length
-            buf.put(0x01)        // command: connect
+            buf.put(0x01)        // command: connect (TCP)
             buf.putShort(port.toShort())
             buf.put(0x02)        // atype: domain
             buf.put(hostBytes.size.toByte())
