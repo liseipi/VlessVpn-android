@@ -5,6 +5,7 @@ import com.vlessvpn.model.VlessConfig
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -16,24 +17,20 @@ import javax.net.ssl.X509TrustManager
 import java.security.cert.X509Certificate
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
 /**
  * 本地 SOCKS5 代理服务器
  * 将 tun2socks 发来的 SOCKS5 请求通过 VLESS+WebSocket 隧道转发
  *
- * 完整还原 client.js 的连接逻辑：
- * - buildVlessHeader()
- * - openTunnel() via WebSocket (HTTP Upgrade)
- * - relay() with VLESS response header parsing
- * - handleSocks5() with early data collection（与 client.js 修复4对齐）
- *
- * protectSocket: 由 VpnService.protect() 提供，保护连接服务器的 socket 不走 VPN，避免路由循环
+ * network: 物理网络引用（VPN 建立前从 ConnectivityManager.activeNetwork 获取），
+ *          用于创建 socket 并解析 DNS，确保流量不走 VPN，避免路由循环。
+ * protectSocket: 由 VpnService.protect() 提供，双重保障。
  */
 class LocalProxyServer(
     private val config: VlessConfig,
     private val listenPort: Int,
+    private val network: android.net.Network? = null,
     private val protectSocket: ((Socket) -> Unit)? = null
 ) {
     companion object {
@@ -45,7 +42,7 @@ class LocalProxyServer(
     private val executor: ExecutorService = Executors.newCachedThreadPool()
     @Volatile private var running = false
 
-    // 创建忽略证书的 SSLContext（与 client.js rejectUnauthorized:false 一致）
+    // 忽略证书验证（与 client.js rejectUnauthorized:false 一致）
     private val sslContext: SSLContext by lazy {
         val trustAll = arrayOf<TrustManager>(object : X509TrustManager {
             override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) {}
@@ -95,111 +92,81 @@ class LocalProxyServer(
                 val inp = client.getInputStream()
                 val out = client.getOutputStream()
 
-                // 1. 读取握手
-                val greeting = readBytes(inp, 2) ?: return
-                if (greeting[0] != 0x05.toByte()) return
-                val nmethods = greeting[1].toInt() and 0xFF
-                readBytes(inp, nmethods) ?: return
+                // 1. 握手：VER + NMETHODS + METHODS
+                val ver = inp.read()
+                if (ver != 5) return
+                val nmethods = inp.read()
+                if (nmethods < 0) return
+                val methods = ByteArray(nmethods)
+                readFully(inp, methods) ?: return
 
                 // 2. 回复：无认证
                 out.write(byteArrayOf(0x05, 0x00))
                 out.flush()
 
-                // 3. 读取请求
-                val req = readAtLeast(inp, 4) ?: return
-                if (req[0] != 0x05.toByte() || req[1] != 0x01.toByte()) return
+                // 3. 请求头固定 4 字节：VER CMD RSV ATYP
+                val header = ByteArray(4)
+                readFully(inp, header) ?: return
+                if (header[0] != 0x05.toByte() || header[1] != 0x01.toByte()) {
+                    Log.w(TAG, "Unsupported SOCKS5 cmd: ${header[1]}")
+                    return
+                }
 
-                val atyp = req[3].toInt() and 0xFF
+                val atyp = header[3].toInt() and 0xFF
+
+                // 4. 根据 atyp 读取目标地址和端口
                 val host: String
                 val port: Int
 
                 when (atyp) {
                     0x01 -> { // IPv4
-                        val addr = readBytes(inp, 4) ?: return
-                        host = "${addr[0].toInt() and 0xFF}.${addr[1].toInt() and 0xFF}.${addr[2].toInt() and 0xFF}.${addr[3].toInt() and 0xFF}"
-                        val portBytes = readBytes(inp, 2) ?: return
+                        val addr = ByteArray(4)
+                        readFully(inp, addr) ?: return
+                        host = InetAddress.getByAddress(addr).hostAddress ?: return
+                        val portBytes = ByteArray(2)
+                        readFully(inp, portBytes) ?: return
                         port = ((portBytes[0].toInt() and 0xFF) shl 8) or (portBytes[1].toInt() and 0xFF)
                     }
                     0x03 -> { // Domain
-                        val lenByte = readBytes(inp, 1) ?: return
-                        val len = lenByte[0].toInt() and 0xFF
-                        val domainBytes = readBytes(inp, len) ?: return
+                        val lenByte = inp.read()
+                        if (lenByte < 0) return
+                        val domainBytes = ByteArray(lenByte)
+                        readFully(inp, domainBytes) ?: return
                         host = String(domainBytes)
-                        val portBytes = readBytes(inp, 2) ?: return
+                        val portBytes = ByteArray(2)
+                        readFully(inp, portBytes) ?: return
                         port = ((portBytes[0].toInt() and 0xFF) shl 8) or (portBytes[1].toInt() and 0xFF)
                     }
                     0x04 -> { // IPv6
-                        val addr = readBytes(inp, 16) ?: return
-                        val sb = StringBuilder()
-                        for (i in 0 until 8) {
-                            if (i > 0) sb.append(":")
-                            sb.append(Integer.toHexString(((addr[i*2].toInt() and 0xFF) shl 8) or (addr[i*2+1].toInt() and 0xFF)))
-                        }
-                        host = sb.toString()
-                        val portBytes = readBytes(inp, 2) ?: return
+                        val addr = ByteArray(16)
+                        readFully(inp, addr) ?: return
+                        host = InetAddress.getByAddress(addr).hostAddress ?: return
+                        val portBytes = ByteArray(2)
+                        readFully(inp, portBytes) ?: return
                         port = ((portBytes[0].toInt() and 0xFF) shl 8) or (portBytes[1].toInt() and 0xFF)
                     }
-                    else -> return
+                    else -> {
+                        Log.w(TAG, "Unsupported ATYP: $atyp")
+                        return
+                    }
                 }
 
-                // 4. 回复 SOCKS5 成功
+                // 5. 回复 SOCKS5 成功
                 out.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
                 out.flush()
 
-                Log.d(TAG, "SOCKS5 -> $host:$port")
+                Log.d(TAG, "SOCKS5 connect -> $host:$port (atyp=$atyp)")
 
-                // 5. 对齐 client.js 修复4：
-                //    回复 SOCKS5 成功后立即开始在独立线程收集 early data，
-                //    等隧道建立后把 vlessHeader + earlyData 合并成第一个包发送，
-                //    避免客户端抢先发送的数据丢失导致连接卡住。
-                val earlyData = java.io.ByteArrayOutputStream()
-                val earlyLock = Object()
-                val earlyDone = AtomicBoolean(false)
-
-                val earlyThread = thread(name = "early-data") {
-                    try {
-                        val buf = ByteArray(BUFFER_SIZE)
-                        client.soTimeout = 100  // 短超时，感知 earlyDone
-                        while (!earlyDone.get()) {
-                            try {
-                                val n = inp.read(buf)
-                                if (n == -1) break
-                                synchronized(earlyLock) {
-                                    if (!earlyDone.get()) earlyData.write(buf, 0, n)
-                                }
-                            } catch (_: java.net.SocketTimeoutException) {
-                                // 正常超时，继续检查 earlyDone
-                            }
-                        }
-                    } catch (_: Exception) {}
-                }
-
-                // 6. 建立 WebSocket 隧道
+                // 6. 建立 WebSocket 隧道并中继
                 try {
                     openTunnel { _, tunnelOut, tunnelIn ->
-                        // 隧道就绪，停止 early data 收集
-                        earlyDone.set(true)
-                        earlyThread.join(500)
-                        client.soTimeout = 0  // 恢复无超时
-
-                        // 构造第一个包：vlessHeader + earlyData（对齐 client.js firstPkt）
-                        val vlessHdr = buildVlessHeader(config.uuid, host, port)
-                        val collected = synchronized(earlyLock) { earlyData.toByteArray() }
-                        val firstPkt = if (collected.isNotEmpty()) {
-                            vlessHdr + collected
-                        } else {
-                            vlessHdr
-                        }
-                        tunnelOut.write(firstPkt)
+                        val vlessHdr = buildVlessHeader(host, port)
+                        tunnelOut.write(vlessHdr)
                         tunnelOut.flush()
-
-                        // 双向中继
                         relay(client, inp, out, tunnelIn, tunnelOut)
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "SOCKS5 handler error: ${e.message}")
-                    earlyDone.set(true)
-                    earlyThread.join(500)
+                    Log.e(TAG, "Tunnel error for $host:$port : ${e.message}")
                 }
 
             } catch (e: Exception) {
@@ -208,19 +175,26 @@ class LocalProxyServer(
         }
     }
 
-    // ── 建立 WebSocket 隧道 (手动 HTTP Upgrade，与 client.js 完全一致) ─────────
+    // ── 建立 WebSocket 隧道 ───────────────────────────────────────────────────
 
     private fun openTunnel(block: (socket: Socket, out: OutputStream, inp: InputStream) -> Unit) {
-        val useTls = config.isTls()
-        val rawSocket = Socket()
+        // ✅ 关键修复：用物理网络的 socketFactory 创建 socket
+        // network.socketFactory 创建的 socket 的 DNS 解析也走物理网络，不走 VPN
+        // 这样 InetSocketAddress(hostname, port) 的 DNS 解析不会产生路由循环
+        val rawSocket: Socket = if (network != null) {
+            network.socketFactory.createSocket()
+        } else {
+            Socket()
+        }
 
-        // 关键：在 connect 之前调用 protect，让这个 socket 绕过 VPN 路由，避免循环
+        // protect 作为双重保障，防止 network 为 null 时的回退路径
         protectSocket?.invoke(rawSocket)
 
+        // 现在可以安全地用 hostname 连接，DNS 走物理网络
         rawSocket.connect(InetSocketAddress(config.serverHost, config.serverPort), 15000)
-        rawSocket.soTimeout = 0  // no timeout for relay
+        rawSocket.soTimeout = 0
 
-        val socket: Socket = if (useTls) {
+        val socket: Socket = if (config.isTls()) {
             val ssl = sslContext.socketFactory.createSocket(
                 rawSocket, config.serverHost, config.serverPort, true
             ) as SSLSocket
@@ -259,8 +233,8 @@ class LocalProxyServer(
         out.write(request.toByteArray())
         out.flush()
 
-        // 读取 HTTP 响应头
         val respLine = readHttpResponseLine(inp)
+        Log.d(TAG, "WS handshake response: $respLine")
         if (!respLine.contains("101")) {
             socket.close()
             throw IOException("WebSocket upgrade failed: $respLine")
@@ -271,7 +245,7 @@ class LocalProxyServer(
             if (line.isEmpty()) break
         }
 
-        Log.d(TAG, "WebSocket tunnel established")
+        Log.d(TAG, "WebSocket tunnel established to ${config.serverHost}:${config.serverPort}")
         try {
             block(socket, WebSocketOutputStream(out), WebSocketInputStream(inp))
         } finally {
@@ -279,7 +253,7 @@ class LocalProxyServer(
         }
     }
 
-    // ── WebSocket 帧封装/解封 ─────────────────────────────────────────────────
+    // ── WebSocket 帧封装 ──────────────────────────────────────────────────────
 
     inner class WebSocketOutputStream(private val raw: OutputStream) : OutputStream() {
         override fun write(b: Int) = write(byteArrayOf(b.toByte()))
@@ -316,6 +290,8 @@ class LocalProxyServer(
         }
     }
 
+    // ── WebSocket 帧解封 ──────────────────────────────────────────────────────
+
     inner class WebSocketInputStream(private val raw: InputStream) : InputStream() {
         private var currentFrame: ByteArray? = null
         private var pos = 0
@@ -331,7 +307,7 @@ class LocalProxyServer(
                 currentFrame = nextFrame() ?: return -1
                 pos = 0
             }
-            val n = Math.min(len, currentFrame!!.size - pos)
+            val n = minOf(len, currentFrame!!.size - pos)
             System.arraycopy(currentFrame!!, pos, b, off, n)
             pos += n
             return n
@@ -355,52 +331,73 @@ class LocalProxyServer(
                     for (i in 0 until 8) payloadLen = (payloadLen shl 8) or raw.read().toLong()
                 }
 
-                val mask = if (masked) {
+                val maskBytes = if (masked) {
                     val m = ByteArray(4)
-                    raw.read(m)
+                    readFully(raw, m)
                     m
                 } else null
 
                 val data = ByteArray(payloadLen.toInt())
-                var read = 0
-                while (read < payloadLen) {
-                    val n = raw.read(data, read, payloadLen.toInt() - read)
-                    if (n == -1) break
-                    read += n
+                readFully(raw, data) ?: return null
+
+                if (maskBytes != null) {
+                    for (i in data.indices) data[i] = (data[i].toInt() xor maskBytes[i % 4].toInt()).toByte()
                 }
 
-                if (mask != null) {
-                    for (i in data.indices) data[i] = (data[i].toInt() xor mask[i % 4].toInt()).toByte()
+                return when (opcode) {
+                    0x00, 0x01, 0x02 -> data  // continuation, text, binary
+                    0x08 -> null               // close
+                    else -> continue           // ping/pong，忽略继续读
                 }
-
-                if (opcode == 0x02 || opcode == 0x01 || opcode == 0x00) {
-                    return data
-                } else if (opcode == 0x08) {
-                    return null // Close
-                }
-                // Ignore other opcodes (ping/pong)
             }
         }
     }
 
-    // ── VLESS 协议 & 中继 ──────────────────────────────────────────────────────
+    // ── VLESS 协议头（对齐 client.js buildVlessHeader）────────────────────────
 
-    private fun buildVlessHeader(uuid: String, host: String, port: Int): ByteArray {
-        val uuidBytes = uuid.replace("-", "").chunked(2).map { it.toInt(16).toByte() }.toByteArray()
-        val hostBytes = host.toByteArray()
-        val header = ByteBuffer.allocate(1 + 16 + 1 + 1 + 1 + hostBytes.size + 2)
-        header.put(0x00.toByte()) // Version 0
-        header.put(uuidBytes)    // UUID
-        header.put(0x00.toByte()) // Addons length 0
-        header.put(0x01.toByte()) // Command Connect
-        header.put(0x03.toByte()) // Domain type (using domain for simplicity)
-        header.put(hostBytes.size.toByte())
-        header.put(hostBytes)
-        header.putShort(port.toShort())
-        return header.array()
+    private fun buildVlessHeader(host: String, port: Int): ByteArray {
+        val uuidBytes = config.uuid.replace("-", "")
+            .chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+
+        // 判断地址类型，与 client.js 逻辑完全一致：
+        // IPv4 → atype=1, IPv6 → atype=3(16字节), domain → atype=2
+        return try {
+            val addr = InetAddress.getByName(host)
+            val addrBytes = addr.address
+            val atype: Byte = if (addrBytes.size == 4) 0x01 else 0x03
+            // fixed: version(1) + uuid(16) + addonLen(1) + cmd(1) + port(2) + atype(1) = 22
+            val buf = ByteBuffer.allocate(22 + addrBytes.size)
+            buf.put(0x00)        // version
+            buf.put(uuidBytes)   // uuid
+            buf.put(0x00)        // addon length
+            buf.put(0x01)        // command: connect
+            buf.putShort(port.toShort())
+            buf.put(atype)
+            buf.put(addrBytes)
+            buf.array()
+        } catch (e: Exception) {
+            // domain
+            val hostBytes = host.toByteArray(Charsets.UTF_8)
+            val buf = ByteBuffer.allocate(22 + 1 + hostBytes.size)
+            buf.put(0x00)        // version
+            buf.put(uuidBytes)   // uuid
+            buf.put(0x00)        // addon length
+            buf.put(0x01)        // command: connect
+            buf.putShort(port.toShort())
+            buf.put(0x02)        // atype: domain
+            buf.put(hostBytes.size.toByte())
+            buf.put(hostBytes)
+            buf.array()
+        }
     }
 
-    private fun relay(client: Socket, clientIn: InputStream, clientOut: OutputStream, tunnelIn: InputStream, tunnelOut: OutputStream) {
+    // ── 双向中继（对齐 client.js relay()）───────────────────────────────────
+
+    private fun relay(
+        client: Socket,
+        clientIn: InputStream, clientOut: OutputStream,
+        tunnelIn: InputStream, tunnelOut: OutputStream
+    ) {
         val t1 = thread(name = "relay-up") {
             try {
                 val buf = ByteArray(BUFFER_SIZE)
@@ -415,17 +412,36 @@ class LocalProxyServer(
 
         val t2 = thread(name = "relay-down") {
             try {
-                // VLESS 响应头：1字节版本 + 1字节addons长度(忽略addons)
-                val ver = tunnelIn.read()
-                if (ver != -1) {
-                    val addonLen = tunnelIn.read()
-                    if (addonLen > 0) readBytes(tunnelIn, addonLen) // skip addons
-                    
-                    val buf = ByteArray(BUFFER_SIZE)
-                    while (true) {
-                        val n = tunnelIn.read(buf)
-                        if (n == -1) break
+                // VLESS 响应头解析（对齐 client.js relay() onMsg 逻辑）：
+                // byte[0]=version, byte[1]=addon_len, 总头长 = 2 + addon_len
+                var respBuf = ByteArray(0)
+                var respSkipped = false
+                var respHdrSize = -1
+                val buf = ByteArray(BUFFER_SIZE)
+
+                while (true) {
+                    val n = tunnelIn.read(buf)
+                    if (n == -1) break
+
+                    if (respSkipped) {
                         clientOut.write(buf, 0, n)
+                        clientOut.flush()
+                        continue
+                    }
+
+                    respBuf = respBuf + buf.copyOf(n)
+                    if (respBuf.size < 2) continue
+
+                    if (respHdrSize == -1) {
+                        respHdrSize = 2 + (respBuf[1].toInt() and 0xFF)
+                    }
+                    if (respBuf.size < respHdrSize) continue
+
+                    respSkipped = true
+                    val payload = respBuf.drop(respHdrSize).toByteArray()
+                    if (payload.isNotEmpty()) {
+                        clientOut.write(payload)
+                        clientOut.flush()
                     }
                 }
             } catch (_: Exception) {}
@@ -438,30 +454,22 @@ class LocalProxyServer(
 
     // ── Utils ────────────────────────────────────────────────────────────────
 
-    private fun readBytes(inp: InputStream, n: Int): ByteArray? {
-        val buf = ByteArray(n)
+    private fun readFully(inp: InputStream, buf: ByteArray): ByteArray? {
         var read = 0
-        while (read < n) {
-            val r = inp.read(buf, read, n - read)
+        while (read < buf.size) {
+            val r = inp.read(buf, read, buf.size - read)
             if (r == -1) return null
             read += r
         }
         return buf
     }
 
-    private fun readAtLeast(inp: InputStream, n: Int): ByteArray? {
-        val buf = ByteArray(BUFFER_SIZE)
-        val r = inp.read(buf, 0, BUFFER_SIZE)
-        if (r < n) return null
-        return buf.copyOf(r)
-    }
-
     private fun readHttpResponseLine(inp: InputStream): String {
         val sb = StringBuilder()
         while (true) {
             val b = inp.read()
-            if (b == -1 || b == '\n'.toInt()) break
-            if (b == '\r'.toInt()) continue
+            if (b == -1 || b == '\n'.code) break
+            if (b == '\r'.code) continue
             sb.append(b.toChar())
         }
         return sb.toString()

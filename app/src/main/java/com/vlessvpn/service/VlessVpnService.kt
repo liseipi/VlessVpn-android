@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -46,6 +47,9 @@ class VlessVpnService : VpnService() {
     private var localProxy: LocalProxyServer? = null
     private var tun2socksThread: Thread? = null
     private var currentConfig: VlessConfig? = null
+
+    // 物理网络引用，在 VPN 建立前捕获，供 LocalProxyServer 绕过 VPN 做 DNS 解析
+    private var underlyingNetwork: android.net.Network? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -96,7 +100,6 @@ class VlessVpnService : VpnService() {
         isStarting = true
         VpnStateManager.setState(VpnStateManager.State.CONNECTING)
 
-        // 启动前台服务，Android 14+ 需要声明 foregroundServiceType
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
                 NOTIFICATION_ID,
@@ -109,16 +112,33 @@ class VlessVpnService : VpnService() {
 
         currentConfig = config
 
-        // 在后台线程执行，避免阻塞 binder/main thread
         thread(name = "vpn-start") {
             val socksPort = ConfigManager.getSocksPort()
 
-            // 1. 启动本地 SOCKS5 代理（VLESS 隧道），传入 protect 回调避免路由循环
+            // ✅ 在 VPN 建立之前捕获物理网络引用
+            // 需要 ACCESS_NETWORK_STATE 权限（已在 AndroidManifest.xml 中声明）
+            // 用 try-catch 防御，即使获取失败也能降级运行（DNS 走 protect 路径）
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            underlyingNetwork = try {
+                cm.activeNetwork.also {
+                    Log.i(TAG, "Underlying network captured: $it")
+                }
+            } catch (e: SecurityException) {
+                Log.w(TAG, "Cannot get activeNetwork (missing permission?): ${e.message}")
+                null
+            } catch (e: Exception) {
+                Log.w(TAG, "Cannot get activeNetwork: ${e.message}")
+                null
+            }
+
+            // 1. 启动本地 SOCKS5 代理（VLESS 隧道）
             try {
-                localProxy = LocalProxyServer(config, socksPort) { socket ->
-                    // 保护 socket 不走 VPN，避免连接服务器时产生循环
-                    protect(socket)
-                }.also { it.start() }
+                localProxy = LocalProxyServer(
+                    config = config,
+                    listenPort = socksPort,
+                    network = underlyingNetwork,
+                    protectSocket = { socket -> protect(socket) }
+                ).also { it.start() }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to start local proxy: ${e.message}")
                 isStarting = false
@@ -199,19 +219,17 @@ class VlessVpnService : VpnService() {
         VpnStateManager.setState(VpnStateManager.State.DISCONNECTING)
         Log.i(TAG, "Stopping VPN...")
 
-        // 停止 tun2socks
         Tun2Socks.stopTun2Socks()
         try { tun2socksThread?.join(3000) } catch (_: Exception) {}
         tun2socksThread = null
 
-        // 关闭 VPN 接口
         try { vpnInterface?.close() } catch (_: Exception) {}
         vpnInterface = null
 
-        // 停止本地代理
         localProxy?.stop()
         localProxy = null
 
+        underlyingNetwork = null
         isRunning = false
         isStarting = false
         currentConfig = null
