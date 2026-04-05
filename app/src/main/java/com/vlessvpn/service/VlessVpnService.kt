@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -38,7 +39,7 @@ class VlessVpnService : VpnService() {
         private const val VPN_MTU       = 1500
 
         @Volatile var isRunning = false
-    @Volatile private var isStarting = false
+        @Volatile var isStarting = false
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
@@ -94,16 +95,30 @@ class VlessVpnService : VpnService() {
 
         isStarting = true
         VpnStateManager.setState(VpnStateManager.State.CONNECTING)
-        startForeground(NOTIFICATION_ID, buildNotification("正在连接...", config.displayName()))
+
+        // 启动前台服务，Android 14+ 需要声明 foregroundServiceType
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIFICATION_ID,
+                buildNotification("正在连接...", config.displayName()),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, buildNotification("正在连接...", config.displayName()))
+        }
+
         currentConfig = config
 
         // 在后台线程执行，避免阻塞 binder/main thread
         thread(name = "vpn-start") {
             val socksPort = ConfigManager.getSocksPort()
 
-            // 1. 启动本地 SOCKS5 代理（VLESS 隧道）
+            // 1. 启动本地 SOCKS5 代理（VLESS 隧道），传入 protect 回调避免路由循环
             try {
-                localProxy = LocalProxyServer(config, socksPort).also { it.start() }
+                localProxy = LocalProxyServer(config, socksPort) { socket ->
+                    // 保护 socket 不走 VPN，避免连接服务器时产生循环
+                    protect(socket)
+                }.also { it.start() }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to start local proxy: ${e.message}")
                 isStarting = false

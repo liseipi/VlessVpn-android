@@ -16,6 +16,7 @@ import javax.net.ssl.X509TrustManager
 import java.security.cert.X509Certificate
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
 /**
@@ -26,11 +27,14 @@ import kotlin.concurrent.thread
  * - buildVlessHeader()
  * - openTunnel() via WebSocket (HTTP Upgrade)
  * - relay() with VLESS response header parsing
- * - handleSocks5()
+ * - handleSocks5() with early data collection（与 client.js 修复4对齐）
+ *
+ * protectSocket: 由 VpnService.protect() 提供，保护连接服务器的 socket 不走 VPN，避免路由循环
  */
 class LocalProxyServer(
     private val config: VlessConfig,
-    private val listenPort: Int
+    private val listenPort: Int,
+    private val protectSocket: ((Socket) -> Unit)? = null
 ) {
     companion object {
         private const val TAG = "LocalProxy"
@@ -138,21 +142,66 @@ class LocalProxyServer(
                     else -> return
                 }
 
-                // 4. 回复成功
+                // 4. 回复 SOCKS5 成功
                 out.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
                 out.flush()
 
                 Log.d(TAG, "SOCKS5 -> $host:$port")
 
-                // 5. 建立 VLESS 隧道
-                openTunnel { _, tunnelOut, tunnelIn ->
-                    val vlessHdr = buildVlessHeader(config.uuid, host, port)
-                    tunnelOut.write(vlessHdr)
-                    tunnelOut.flush()
+                // 5. 对齐 client.js 修复4：
+                //    回复 SOCKS5 成功后立即开始在独立线程收集 early data，
+                //    等隧道建立后把 vlessHeader + earlyData 合并成第一个包发送，
+                //    避免客户端抢先发送的数据丢失导致连接卡住。
+                val earlyData = java.io.ByteArrayOutputStream()
+                val earlyLock = Object()
+                val earlyDone = AtomicBoolean(false)
 
-                    // 双向中继（传入 client socket，用于解除死锁）
-                    relay(client, inp, out, tunnelIn, tunnelOut)
+                val earlyThread = thread(name = "early-data") {
+                    try {
+                        val buf = ByteArray(BUFFER_SIZE)
+                        client.soTimeout = 100  // 短超时，感知 earlyDone
+                        while (!earlyDone.get()) {
+                            try {
+                                val n = inp.read(buf)
+                                if (n == -1) break
+                                synchronized(earlyLock) {
+                                    if (!earlyDone.get()) earlyData.write(buf, 0, n)
+                                }
+                            } catch (_: java.net.SocketTimeoutException) {
+                                // 正常超时，继续检查 earlyDone
+                            }
+                        }
+                    } catch (_: Exception) {}
                 }
+
+                // 6. 建立 WebSocket 隧道
+                try {
+                    openTunnel { _, tunnelOut, tunnelIn ->
+                        // 隧道就绪，停止 early data 收集
+                        earlyDone.set(true)
+                        earlyThread.join(500)
+                        client.soTimeout = 0  // 恢复无超时
+
+                        // 构造第一个包：vlessHeader + earlyData（对齐 client.js firstPkt）
+                        val vlessHdr = buildVlessHeader(config.uuid, host, port)
+                        val collected = synchronized(earlyLock) { earlyData.toByteArray() }
+                        val firstPkt = if (collected.isNotEmpty()) {
+                            vlessHdr + collected
+                        } else {
+                            vlessHdr
+                        }
+                        tunnelOut.write(firstPkt)
+                        tunnelOut.flush()
+
+                        // 双向中继
+                        relay(client, inp, out, tunnelIn, tunnelOut)
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "SOCKS5 handler error: ${e.message}")
+                    earlyDone.set(true)
+                    earlyThread.join(500)
+                }
+
             } catch (e: Exception) {
                 Log.e(TAG, "SOCKS5 handler error: ${e.message}")
             }
@@ -164,6 +213,10 @@ class LocalProxyServer(
     private fun openTunnel(block: (socket: Socket, out: OutputStream, inp: InputStream) -> Unit) {
         val useTls = config.isTls()
         val rawSocket = Socket()
+
+        // 关键：在 connect 之前调用 protect，让这个 socket 绕过 VPN 路由，避免循环
+        protectSocket?.invoke(rawSocket)
+
         rawSocket.connect(InetSocketAddress(config.serverHost, config.serverPort), 15000)
         rawSocket.soTimeout = 0  // no timeout for relay
 
@@ -185,9 +238,8 @@ class LocalProxyServer(
         val key = android.util.Base64.encodeToString(
             java.security.SecureRandom().generateSeed(16), android.util.Base64.NO_WRAP
         )
-        // 正确提取 path+query：从 host:port 之后取第一个 / 及其后面全部内容
         val wsUrl = config.buildWsUrl()
-        val afterScheme = wsUrl.substringAfter("://")           // host:port/path?query
+        val afterScheme = wsUrl.substringAfter("://")
         val slashIdx = afterScheme.indexOf('/')
         val pathWithQuery = if (slashIdx >= 0) afterScheme.substring(slashIdx) else "/"
 
@@ -229,9 +281,6 @@ class LocalProxyServer(
 
     // ── WebSocket 帧封装/解封 ─────────────────────────────────────────────────
 
-    /**
-     * 将数据封装为 WebSocket 二进制帧（客户端需要 mask）
-     */
     inner class WebSocketOutputStream(private val raw: OutputStream) : OutputStream() {
         override fun write(b: Int) = write(byteArrayOf(b.toByte()))
         override fun write(b: ByteArray) = write(b, 0, b.size)
@@ -251,217 +300,108 @@ class LocalProxyServer(
                     0x82.toByte(), (0x80 or 126).toByte(),
                     ((len shr 8) and 0xFF).toByte(), (len and 0xFF).toByte()
                 ) + mask
-                else -> byteArrayOf(
-                    0x82.toByte(), (0x80 or 127).toByte(),
-                    0, 0, 0, 0,
-                    ((len shr 24) and 0xFF).toByte(), ((len shr 16) and 0xFF).toByte(),
-                    ((len shr 8) and 0xFF).toByte(), (len and 0xFF).toByte()
-                ) + mask
+                else -> {
+                    val b = ByteBuffer.allocate(10)
+                    b.put(0x82.toByte())
+                    b.put((0x80 or 127).toByte())
+                    b.putLong(len.toLong())
+                    b.array() + mask
+                }
             }
-            val payload = ByteArray(len) { i -> (data[off + i].toInt() xor mask[i % 4].toInt()).toByte() }
-            return header + payload
+            val masked = ByteArray(len)
+            for (i in 0 until len) {
+                masked[i] = (data[off + i].toInt() xor mask[i % 4].toInt()).toByte()
+            }
+            return header + masked
         }
     }
 
-    /**
-     * 从 WebSocket 帧中读取数据
-     */
     inner class WebSocketInputStream(private val raw: InputStream) : InputStream() {
-        private var frameBuffer = ByteArray(0)
-        private var framePos = 0
+        private var currentFrame: ByteArray? = null
+        private var pos = 0
 
         override fun read(): Int {
             val b = ByteArray(1)
-            return if (read(b, 0, 1) == -1) -1 else (b[0].toInt() and 0xFF)
+            val n = read(b, 0, 1)
+            return if (n == -1) -1 else b[0].toInt() and 0xFF
         }
 
         override fun read(b: ByteArray, off: Int, len: Int): Int {
-            while (framePos >= frameBuffer.size) {
-                frameBuffer = readNextFrame() ?: return -1
-                framePos = 0
+            if (currentFrame == null || pos >= currentFrame!!.size) {
+                currentFrame = nextFrame() ?: return -1
+                pos = 0
             }
-            val available = frameBuffer.size - framePos
-            val toRead = minOf(len, available)
-            System.arraycopy(frameBuffer, framePos, b, off, toRead)
-            framePos += toRead
-            return toRead
+            val n = Math.min(len, currentFrame!!.size - pos)
+            System.arraycopy(currentFrame!!, pos, b, off, n)
+            pos += n
+            return n
         }
 
-        private fun readNextFrame(): ByteArray? {
+        private fun nextFrame(): ByteArray? {
             while (true) {
-                val b0 = raw.read()
-                if (b0 == -1) return null
-                val b1 = raw.read()
-                if (b1 == -1) return null
+                val h1 = raw.read()
+                if (h1 == -1) return null
+                val h2 = raw.read()
+                if (h2 == -1) return null
 
-                val opcode = b0 and 0x0F
-                val masked = (b1 and 0x80) != 0
-                var payloadLen = (b1 and 0x7F).toLong()
+                val opcode = h1 and 0x0F
+                val masked = (h2 and 0x80) != 0
+                var payloadLen = (h2 and 0x7F).toLong()
 
-                payloadLen = when (payloadLen.toInt()) {
-                    126 -> {
-                        val ext = ByteArray(2)
-                        readFully(raw, ext)
-                        ((ext[0].toLong() and 0xFF) shl 8) or (ext[1].toLong() and 0xFF)
-                    }
-                    127 -> {
-                        val ext = ByteArray(8)
-                        readFully(raw, ext)
-                        var v = 0L
-                        for (i in 0..7) v = (v shl 8) or (ext[i].toLong() and 0xFF)
-                        v
-                    }
-                    else -> payloadLen
+                if (payloadLen == 126L) {
+                    payloadLen = ((raw.read() shl 8) or raw.read()).toLong()
+                } else if (payloadLen == 127L) {
+                    payloadLen = 0
+                    for (i in 0 until 8) payloadLen = (payloadLen shl 8) or raw.read().toLong()
                 }
 
-                val maskKey = if (masked) ByteArray(4).also { readFully(raw, it) } else null
-                val payload = ByteArray(payloadLen.toInt())
-                readFully(raw, payload)
+                val mask = if (masked) {
+                    val m = ByteArray(4)
+                    raw.read(m)
+                    m
+                } else null
 
-                if (maskKey != null) {
-                    for (i in payload.indices) payload[i] = (payload[i].toInt() xor maskKey[i % 4].toInt()).toByte()
+                val data = ByteArray(payloadLen.toInt())
+                var read = 0
+                while (read < payloadLen) {
+                    val n = raw.read(data, read, payloadLen.toInt() - read)
+                    if (n == -1) break
+                    read += n
                 }
 
-                // opcode 8 = close, 9 = ping, 10 = pong
-                if (opcode == 8) return null
-                if (opcode == 9) {  // ping -> send pong
-                    // ignore for now
-                    continue
+                if (mask != null) {
+                    for (i in data.indices) data[i] = (data[i].toInt() xor mask[i % 4].toInt()).toByte()
                 }
-                if (payload.isEmpty()) continue
-                return payload
-            }
-        }
 
-        private fun readFully(inp: InputStream, buf: ByteArray) {
-            var off = 0
-            while (off < buf.size) {
-                val n = inp.read(buf, off, buf.size - off)
-                if (n == -1) throw IOException("Stream closed")
-                off += n
+                if (opcode == 0x02 || opcode == 0x01 || opcode == 0x00) {
+                    return data
+                } else if (opcode == 0x08) {
+                    return null // Close
+                }
+                // Ignore other opcodes (ping/pong)
             }
         }
     }
 
-    // ── VLESS 请求头构造 (完全还原 client.js buildVlessHeader) ────────────────
+    // ── VLESS 协议 & 中继 ──────────────────────────────────────────────────────
 
     private fun buildVlessHeader(uuid: String, host: String, port: Int): ByteArray {
-        val uid = hexToBytes(uuid.replace("-", ""))
-
-        // 判断地址类型
-        val (atype, abuf) = when {
-            isIPv4(host) -> {
-                val parts = host.split(".").map { it.toInt().toByte() }
-                Pair(1.toByte(), parts.toByteArray())
-            }
-            isIPv6(host) -> {
-                Pair(3.toByte(), ipv6ToBytes(host))
-            }
-            else -> {
-                val db = host.toByteArray(Charsets.UTF_8)
-                Pair(2.toByte(), byteArrayOf(db.size.toByte()) + db)
-            }
-        }
-
-        // fixed header: version(1) + uuid(16) + addon_len(1) + cmd(1) + port(2) + atype(1) = 22
-        val fixed = ByteBuffer.allocate(22).apply {
-            put(0x00)           // version
-            put(uid)            // uuid (16 bytes)
-            put(0x00)           // addon length
-            put(0x01)           // cmd = TCP
-            putShort(port.toShort())  // port
-            put(atype)          // address type
-        }.array()
-
-        return fixed + abuf
+        val uuidBytes = uuid.replace("-", "").chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        val hostBytes = host.toByteArray()
+        val header = ByteBuffer.allocate(1 + 16 + 1 + 1 + 1 + hostBytes.size + 2)
+        header.put(0x00.toByte()) // Version 0
+        header.put(uuidBytes)    // UUID
+        header.put(0x00.toByte()) // Addons length 0
+        header.put(0x01.toByte()) // Command Connect
+        header.put(0x03.toByte()) // Domain type (using domain for simplicity)
+        header.put(hostBytes.size.toByte())
+        header.put(hostBytes)
+        header.putShort(port.toShort())
+        return header.array()
     }
 
-    private fun hexToBytes(hex: String): ByteArray {
-        return ByteArray(hex.length / 2) { i ->
-            hex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
-        }
-    }
-
-    private fun isIPv4(host: String): Boolean {
-        return host.matches(Regex("^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$"))
-    }
-
-    private fun isIPv6(host: String): Boolean {
-        return host.contains(":")
-    }
-
-    private fun ipv6ToBytes(addr: String): ByteArray {
-        val buf = ByteArray(16)
-        val groups: List<String>
-        if (addr.contains("::")) {
-            val parts = addr.split("::")
-            val left = if (parts[0].isEmpty()) emptyList() else parts[0].split(":")
-            val right = if (parts.size < 2 || parts[1].isEmpty()) emptyList() else parts[1].split(":")
-            val mid = List(8 - left.size - right.size) { "0" }
-            groups = left + mid + right
-        } else {
-            groups = addr.split(":")
-        }
-        groups.forEachIndexed { i, g ->
-            val v = g.ifEmpty { "0" }.toInt(16)
-            buf[i * 2] = ((v shr 8) and 0xFF).toByte()
-            buf[i * 2 + 1] = (v and 0xFF).toByte()
-        }
-        return buf
-    }
-
-    // ── 双向中继 (还原 client.js relay，含 VLESS 响应头跳过) ─────────────────
-
-    private fun relay(
-        clientSocket: Socket,       // 用于在一端结束时关闭整个 socket，解除另一端的阻塞
-        clientIn: InputStream,
-        clientOut: OutputStream,
-        tunnelIn: InputStream,
-        tunnelOut: OutputStream
-    ) {
-        // 从隧道到客户端（需先跳过 VLESS 响应头）
-        val t2c = thread(name = "relay-t2c") {
-            try {
-                val accumulator = java.io.ByteArrayOutputStream()
-                var respSkipped = false
-                var respHdrSize = -1
-                val buf = ByteArray(BUFFER_SIZE)
-
-                while (true) {
-                    val n = tunnelIn.read(buf)
-                    if (n == -1) break
-
-                    if (respSkipped) {
-                        clientOut.write(buf, 0, n)
-                        clientOut.flush()
-                        continue
-                    }
-
-                    accumulator.write(buf, 0, n)
-                    val respBuf = accumulator.toByteArray()
-                    if (respBuf.size < 2) continue
-
-                    if (respHdrSize == -1) {
-                        // byte[0]=version, byte[1]=addon_len => 总头长 = 2 + addon_len
-                        respHdrSize = 2 + (respBuf[1].toInt() and 0xFF)
-                    }
-                    if (respBuf.size < respHdrSize) continue
-
-                    respSkipped = true
-                    accumulator.reset()
-                    val payload = respBuf.copyOfRange(respHdrSize, respBuf.size)
-                    if (payload.isNotEmpty()) {
-                        clientOut.write(payload)
-                        clientOut.flush()
-                    }
-                }
-            } catch (_: Exception) {}
-            // t2c 结束：关闭整个 clientSocket，让 c2t 的 clientIn.read() 收到 EOF
-            try { clientSocket.close() } catch (_: Exception) {}
-        }
-
-        // 从客户端到隧道
-        val c2t = thread(name = "relay-c2t") {
+    private fun relay(client: Socket, clientIn: InputStream, clientOut: OutputStream, tunnelIn: InputStream, tunnelOut: OutputStream) {
+        val t1 = thread(name = "relay-up") {
             try {
                 val buf = ByteArray(BUFFER_SIZE)
                 while (true) {
@@ -470,49 +410,59 @@ class LocalProxyServer(
                     tunnelOut.write(buf, 0, n)
                 }
             } catch (_: Exception) {}
-            // c2t 结束：关闭 tunnelOut 通知隧道侧
-            try { tunnelOut.close() } catch (_: Exception) {}
+            finally { try { client.close() } catch (_: Exception) {} }
         }
 
-        t2c.join()
-        c2t.join()
+        val t2 = thread(name = "relay-down") {
+            try {
+                // VLESS 响应头：1字节版本 + 1字节addons长度(忽略addons)
+                val ver = tunnelIn.read()
+                if (ver != -1) {
+                    val addonLen = tunnelIn.read()
+                    if (addonLen > 0) readBytes(tunnelIn, addonLen) // skip addons
+                    
+                    val buf = ByteArray(BUFFER_SIZE)
+                    while (true) {
+                        val n = tunnelIn.read(buf)
+                        if (n == -1) break
+                        clientOut.write(buf, 0, n)
+                    }
+                }
+            } catch (_: Exception) {}
+            finally { try { client.close() } catch (_: Exception) {} }
+        }
+
+        t1.join()
+        t2.join()
     }
 
-    // ── 工具方法 ──────────────────────────────────────────────────────────────
+    // ── Utils ────────────────────────────────────────────────────────────────
 
-    private fun readBytes(inp: InputStream, count: Int): ByteArray? {
-        val buf = ByteArray(count)
-        var off = 0
-        while (off < count) {
-            val n = inp.read(buf, off, count - off)
-            if (n == -1) return null
-            off += n
+    private fun readBytes(inp: InputStream, n: Int): ByteArray? {
+        val buf = ByteArray(n)
+        var read = 0
+        while (read < n) {
+            val r = inp.read(buf, read, n - read)
+            if (r == -1) return null
+            read += r
         }
         return buf
     }
 
-    private fun readAtLeast(inp: InputStream, min: Int): ByteArray? {
-        val buf = ByteArray(min)
-        var off = 0
-        while (off < min) {
-            val n = inp.read(buf, off, min - off)
-            if (n == -1) return null
-            off += n
-        }
-        return buf
+    private fun readAtLeast(inp: InputStream, n: Int): ByteArray? {
+        val buf = ByteArray(BUFFER_SIZE)
+        val r = inp.read(buf, 0, BUFFER_SIZE)
+        if (r < n) return null
+        return buf.copyOf(r)
     }
 
     private fun readHttpResponseLine(inp: InputStream): String {
         val sb = StringBuilder()
-        var prev = 0
         while (true) {
-            val c = inp.read()
-            if (c == -1) break
-            if (c == '\n'.code && prev == '\r'.code) {
-                return sb.dropLast(1).toString()
-            }
-            sb.append(c.toChar())
-            prev = c
+            val b = inp.read()
+            if (b == -1 || b == '\n'.toInt()) break
+            if (b == '\r'.toInt()) continue
+            sb.append(b.toChar())
         }
         return sb.toString()
     }
