@@ -24,3 +24,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "VlessVpn"
 include(":app")
+include(":tun2socks")
