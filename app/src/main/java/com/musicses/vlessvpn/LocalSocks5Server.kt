@@ -133,7 +133,26 @@ class LocalSocks5Server(
         if (!connected) { Log.e(TAG, "[$connId] Tunnel failed"); tunnel.close(); return }
 
         Log.i(TAG, "[$connId] ✓ Tunnel ready, relaying $destHost:$destPort")
-        tunnel.relay(inp, out)
+
+        // ── 流量统计包装流（增量模式）────────────────────────────────────────
+        val countingIn = object : InputStream() {
+            override fun read() = inp.read().also { if (it >= 0) onTransfer(0L, 1L) }
+            override fun read(b: ByteArray, off: Int, len: Int) =
+                inp.read(b, off, len).also { n -> if (n > 0) onTransfer(0L, n.toLong()) }
+            override fun available() = inp.available()
+            override fun close() = inp.close()
+        }
+
+        val countingOut = object : java.io.OutputStream() {
+            override fun write(b: Int) { out.write(b); onTransfer(1L, 0L) }
+            override fun write(b: ByteArray, off: Int, len: Int) {
+                out.write(b, off, len); onTransfer(len.toLong(), 0L)
+            }
+            override fun flush() = out.flush()
+            override fun close() = out.close()
+        }
+
+        tunnel.relay(countingIn, countingOut)
     }
 
     // ── UDP ASSOCIATE ─────────────────────────────────────────────────────────
@@ -271,21 +290,18 @@ class LocalSocks5Server(
 
         return try {
             if (isDns) {
-                // 等待并读取第一个 chunk，里面包含 2 字节长度前缀 + DNS 报文
                 val chunk = tunnel.inQueue.poll(5, TimeUnit.SECONDS) ?: return null
                 if (chunk === VlessTunnel.END_MARKER || chunk.size < 2) return null
 
-                // 去掉 VLESS 响应头（version + addonLen）
                 val vlessHeaderLen = 2 + (chunk[1].toInt() and 0xFF)
-                val data = if (chunk.size > vlessHeaderLen) chunk.copyOfRange(vlessHeaderLen, chunk.size) else return null
+                val data = if (chunk.size > vlessHeaderLen)
+                    chunk.copyOfRange(vlessHeaderLen, chunk.size) else return null
 
-                // data 前两字节是 DNS-over-TCP 长度前缀，去掉后返回 DNS 报文
                 if (data.size < 2) return null
                 val msgLen = ((data[0].toInt() and 0xFF) shl 8) or (data[1].toInt() and 0xFF)
                 if (data.size >= 2 + msgLen) {
                     data.copyOfRange(2, 2 + msgLen)
                 } else {
-                    // 数据不完整，继续读
                     baos.write(data, 2, data.size - 2)
                     var remaining = msgLen - (data.size - 2)
                     while (remaining > 0 && System.currentTimeMillis() < deadline) {

@@ -10,6 +10,7 @@ import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import java.util.Collections
+import java.util.concurrent.atomic.AtomicLong
 
 private const val TAG = "VlessVpnService"
 private const val CH_ID = "vless_vpn"
@@ -35,7 +36,11 @@ class VlessVpnService : VpnService() {
     private var tun: ParcelFileDescriptor? = null
     private var socksServer: LocalSocks5Server? = null
     private var tun2socksThread: Thread? = null
+    private var statsThread: Thread? = null
     @Volatile private var running = false
+
+    private val totalIn  = AtomicLong(0)
+    private val totalOut = AtomicLong(0)
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         return when (intent?.action) {
@@ -72,9 +77,13 @@ class VlessVpnService : VpnService() {
             Tun2Socks.initialize(this)
             Log.d(TAG, "✓ tun2socks library loaded")
 
+            // 重置流量计数
+            totalIn.set(0)
+            totalOut.set(0)
+
             val server = LocalSocks5Server(cfg, this) { bytesIn, bytesOut ->
-                broadcastStats(bytesIn, bytesOut)
-                updateNotif("↓ ${fmt(bytesIn)}  ↑ ${fmt(bytesOut)}")
+                totalIn.addAndGet(bytesIn)
+                totalOut.addAndGet(bytesOut)
             }
             socksServer = server
             val socksPort = server.start()
@@ -97,6 +106,22 @@ class VlessVpnService : VpnService() {
             broadcast("CONNECTED")
             updateNotif("${cfg.name} • Connected")
 
+            // ── 定时广播流量统计 ──────────────────────────────────────────────
+            val st = Thread({
+                while (running) {
+                    try { Thread.sleep(1000) } catch (_: InterruptedException) { break }
+                    if (running) {
+                        val i = totalIn.get()
+                        val o = totalOut.get()
+                        broadcastStats(i, o)
+                        updateNotif("↓ ${fmt(i)}  ↑ ${fmt(o)}")
+                    }
+                }
+            }, "stats-timer")
+            st.isDaemon = true
+            st.start()
+            statsThread = st
+
             val t = Thread({
                 Log.i(TAG, "tun2socks starting → socks=127.0.0.1:$socksPort  netif=$NET_IF_ADDR")
                 val ok = Tun2Socks.startTun2Socks(
@@ -108,7 +133,7 @@ class VlessVpnService : VpnService() {
                     NET_IF_ADDR,
                     null,
                     NETMASK,
-                    true,   // ★ 开启 UDP，让 DNS UDP 查询走 UDP ASSOCIATE → VLESS TCP 隧道
+                    true,
                     Collections.emptyList()
                 )
                 Log.i(TAG, "tun2socks exited with result: $ok")
@@ -127,6 +152,8 @@ class VlessVpnService : VpnService() {
         if (!running) return
         running = false
         Log.i(TAG, "Stopping VPN...")
+        statsThread?.interrupt()
+        statsThread = null
         try { Tun2Socks.stopTun2Socks() } catch (_: Exception) {}
         tun2socksThread?.join(3000)
         tun2socksThread = null
@@ -148,8 +175,10 @@ class VlessVpnService : VpnService() {
 
     private fun broadcastStats(bytesIn: Long, bytesOut: Long) {
         sendBroadcast(Intent(BROADCAST).apply {
-            putExtra(EXTRA_STATUS, "CONNECTED"); putExtra(EXTRA_IN, bytesIn)
-            putExtra(EXTRA_OUT, bytesOut); setPackage(packageName)
+            putExtra(EXTRA_STATUS, "CONNECTED")
+            putExtra(EXTRA_IN, bytesIn)
+            putExtra(EXTRA_OUT, bytesOut)
+            setPackage(packageName)
         })
     }
 
