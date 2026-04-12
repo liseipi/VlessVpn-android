@@ -29,7 +29,8 @@ class VlessTunnel(
     private val vpnService: VpnService? = null
 ) {
     private val wsRef = AtomicReference<WebSocket?>(null)
-    private val inQueue = LinkedBlockingQueue<ByteArray>(4000)
+//    private val inQueue = LinkedBlockingQueue<ByteArray>(4000)
+    internal val inQueue = LinkedBlockingQueue<ByteArray>(4000)
     private val closed = AtomicBoolean(false)
     private val headerSent = AtomicBoolean(false)
     private var destHost = ""
