@@ -64,15 +64,19 @@ class VlessVpnService : VpnService() {
         try {
             Log.i(TAG, "========== VPN Start ==========")
 
-            // 1. 加载原生库（tun2socks 模块里的 System.loadLibrary("tun2socks")）
-            Tun2Socks.initialize(this)
-            Log.d(TAG, "✓ tun2socks library loaded")
-
-            // 2. 启动本地 SOCKS5 服务器
             val cfg = ConfigStore.loadActive(this)
             Log.i(TAG, "Config: ${cfg.name}  server=${cfg.server}:${cfg.port}")
             broadcast("CONNECTING")
 
+            // ★ 关键：先创建带 protect 的 client
+            VlessTunnel.getOrCreateClient(cfg, this)
+            Log.i(TAG, "✓ Protected OkHttpClient ready")
+
+            // 加载 tun2socks 库
+            Tun2Socks.initialize(this)
+            Log.d(TAG, "✓ tun2socks library loaded")
+
+            // 启动 SOCKS5
             val server = LocalSocks5Server(cfg, this) { bytesIn, bytesOut ->
                 broadcastStats(bytesIn, bytesOut)
                 updateNotif("↓ ${fmt(bytesIn)}  ↑ ${fmt(bytesOut)}")
@@ -81,7 +85,7 @@ class VlessVpnService : VpnService() {
             val socksPort = server.start()
             Log.i(TAG, "✓ SOCKS5 on 127.0.0.1:$socksPort")
 
-            // 3. 建立 TUN 接口
+            // 建立 TUN
             val tunPfd = Builder()
                 .setSession("VlessVPN")
                 .setMtu(MTU)
@@ -90,42 +94,45 @@ class VlessVpnService : VpnService() {
                 .addDnsServer(cfg.dns1)
                 .addDnsServer(cfg.dns2)
                 .addDisallowedApplication(packageName)
-                .establish()
+                .establish() ?: throw Exception("TUN establish failed")
 
-            if (tunPfd == null) {
-                Log.e(TAG, "✗ TUN establish failed"); broadcast("ERROR"); server.stop(); return
-            }
             tun = tunPfd
-            Log.i(TAG, "✓ TUN fd=${tunPfd.fd}")
+            Log.i(TAG, "✓ TUN established, fd=${tunPfd.fd}")
 
-            // 4. 在独立线程运行 tun2socks（阻塞调用）
-            // ★ Tun2Socks.startTun2Socks 是 static 方法，直接类名调用
+            // 启动 tun2socks（独立线程）
             val t = Thread({
+                Log.i(TAG, "tun2socks starting: fd=${tunPfd.fd} → socks=127.0.0.1:$socksPort")
                 val ok = Tun2Socks.startTun2Socks(
-                    Tun2Socks.LogLevel.NOTICE,   // logLevel
-                    tunPfd,                       // vpnInterfaceFileDescriptor
-                    MTU,                          // vpnInterfaceMtu
-                    "127.0.0.1",                  // socksServerAddress
-                    socksPort,                    // socksServerPort
-                    "10.233.233.2",               // netIPv4Address（tun2socks 虚拟对端）
-                    null,                         // netIPv6Address
-                    "255.255.255.252",            // netmask
-                    false,                        // forwardUdp
-                    Collections.emptyList()       // extraArgs
+                    Tun2Socks.LogLevel.NOTICE,
+                    tunPfd,
+                    MTU,
+                    "127.0.0.1",
+                    socksPort,
+                    VPN_ADDR,                    // 使用 TUN 接口地址作为网关
+                    null,
+                    "255.255.255.0",             // ← 改成 /24，和 addAddress 一致
+                    true,                        // ← 开启 UDP 转发（非常重要）
+                    Collections.emptyList()
                 )
-                Log.i(TAG, "tun2socks exited: ok=$ok")
+                Log.i(TAG, "tun2socks exited with result: $ok")
+
+                if (!ok) {
+                    Log.e(TAG, "✗ tun2socks failed to start!")
+                }
             }, "tun2socks-main")
+
             t.isDaemon = true
             t.start()
             tun2socksThread = t
 
-            Log.i(TAG, "✓ VPN Connected (tun2socks)")
+            Log.i(TAG, "✓ VPN Connected (tun2socks + VLESS)")
             broadcast("CONNECTED")
             updateNotif("${cfg.name} • Connected")
 
         } catch (e: Exception) {
             Log.e(TAG, "VPN start error", e)
-            broadcast("ERROR"); cleanup()
+            broadcast("ERROR")
+            cleanup()
         }
     }
 
@@ -134,9 +141,12 @@ class VlessVpnService : VpnService() {
         running = false
         Log.i(TAG, "Stopping VPN...")
 
-        // ★ Tun2Socks.stopTun2Socks() 也是 static 方法
-        try { Tun2Socks.stopTun2Socks() } catch (_: Exception) {}
-        tun2socksThread?.join(3000)
+        try {
+            Tun2Socks.stopTun2Socks()
+        } catch (_: Exception) {}
+
+        // 等待 tun2socks 线程退出（最多等 2 秒，避免卡住）
+        tun2socksThread?.join(2000)
         tun2socksThread = null
 
         cleanup()
