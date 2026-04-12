@@ -14,7 +14,10 @@ import java.util.Collections
 private const val TAG = "VlessVpnService"
 private const val CH_ID = "vless_vpn"
 private const val NOTIF_ID = 1
-private const val VPN_ADDR = "10.233.233.1"
+
+// === 关键修改点 ===
+private const val VPN_ADDR = "10.0.0.2"      // 改成常用 VPN 虚拟 IP
+private const val VPN_GATEWAY = "10.0.0.1"   // 网关必须与 TUN 地址不同网段
 private const val VPN_PREFIX = 24
 private const val MTU = 1500
 
@@ -68,11 +71,10 @@ class VlessVpnService : VpnService() {
             Log.i(TAG, "Config: ${cfg.name}  server=${cfg.server}:${cfg.port}")
             broadcast("CONNECTING")
 
-            // ★ 关键：先创建带 protect 的 client
+            // ★ 先创建带 protect 的 client（必须在 TUN 之前）
             VlessTunnel.getOrCreateClient(cfg, this)
             Log.i(TAG, "✓ Protected OkHttpClient ready")
 
-            // 加载 tun2socks 库
             Tun2Socks.initialize(this)
             Log.d(TAG, "✓ tun2socks library loaded")
 
@@ -97,35 +99,32 @@ class VlessVpnService : VpnService() {
                 .establish() ?: throw Exception("TUN establish failed")
 
             tun = tunPfd
-            Log.i(TAG, "✓ TUN established, fd=${tunPfd.fd}")
+            Log.i(TAG, "✓ TUN established, fd=${tunPfd.fd}, addr=$VPN_ADDR/$VPN_PREFIX")
 
-            // 启动 tun2socks（独立线程）
+            // 启动 tun2socks（关键参数已优化）
             val t = Thread({
-                Log.i(TAG, "tun2socks starting: fd=${tunPfd.fd} → socks=127.0.0.1:$socksPort")
+                Log.i(TAG, "tun2socks starting → socks=127.0.0.1:$socksPort  gateway=$VPN_GATEWAY")
                 val ok = Tun2Socks.startTun2Socks(
                     Tun2Socks.LogLevel.NOTICE,
                     tunPfd,
                     MTU,
                     "127.0.0.1",
                     socksPort,
-                    VPN_ADDR,                    // 使用 TUN 接口地址作为网关
+                    VPN_GATEWAY,           // 使用独立网关
                     null,
-                    "255.255.255.0",             // ← 改成 /24，和 addAddress 一致
-                    true,                        // ← 开启 UDP 转发（非常重要）
+                    "255.255.255.0",       // /24 子网
+                    true,                  // 开启 UDP 转发
                     Collections.emptyList()
                 )
                 Log.i(TAG, "tun2socks exited with result: $ok")
-
-                if (!ok) {
-                    Log.e(TAG, "✗ tun2socks failed to start!")
-                }
+                if (!ok) Log.e(TAG, "✗ tun2socks 启动失败！")
             }, "tun2socks-main")
 
             t.isDaemon = true
             t.start()
             tun2socksThread = t
 
-            Log.i(TAG, "✓ VPN Connected (tun2socks + VLESS)")
+            Log.i(TAG, "✓ VPN Connected")
             broadcast("CONNECTED")
             updateNotif("${cfg.name} • Connected")
 
@@ -141,11 +140,7 @@ class VlessVpnService : VpnService() {
         running = false
         Log.i(TAG, "Stopping VPN...")
 
-        try {
-            Tun2Socks.stopTun2Socks()
-        } catch (_: Exception) {}
-
-        // 等待 tun2socks 线程退出（最多等 2 秒，避免卡住）
+        try { Tun2Socks.stopTun2Socks() } catch (_: Exception) {}
         tun2socksThread?.join(2000)
         tun2socksThread = null
 
@@ -162,16 +157,17 @@ class VlessVpnService : VpnService() {
     }
 
     private fun broadcast(status: String) {
-        Log.d(TAG, "Status → $status")
         sendBroadcast(Intent(BROADCAST).apply {
-            putExtra(EXTRA_STATUS, status); setPackage(packageName)
+            putExtra(EXTRA_STATUS, status)
+            setPackage(packageName)
         })
     }
 
     private fun broadcastStats(bytesIn: Long, bytesOut: Long) {
         sendBroadcast(Intent(BROADCAST).apply {
             putExtra(EXTRA_STATUS, "CONNECTED")
-            putExtra(EXTRA_IN, bytesIn); putExtra(EXTRA_OUT, bytesOut)
+            putExtra(EXTRA_IN, bytesIn)
+            putExtra(EXTRA_OUT, bytesOut)
             setPackage(packageName)
         })
     }
@@ -192,12 +188,13 @@ class VlessVpnService : VpnService() {
             Intent(this, VlessVpnService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+
         return NotificationCompat.Builder(this, CH_ID)
             .setContentTitle("VLESS VPN")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_lock_lock)
             .setContentIntent(openPi)
-            .addAction(0, "Disconnect", stopPi)
+            .addAction(0, "断开", stopPi)
             .setOngoing(true)
             .build()
     }
@@ -208,8 +205,8 @@ class VlessVpnService : VpnService() {
     }
 
     private fun fmt(b: Long) = when {
-        b < 1024L        -> "${b}B"
+        b < 1024L -> "${b}B"
         b < 1024 * 1024L -> "${"%.1f".format(b / 1024.0)}K"
-        else             -> "${"%.1f".format(b / 1048576.0)}M"
+        else -> "${"%.1f".format(b / 1048576.0)}M"
     }
 }
