@@ -25,12 +25,13 @@ private const val MTU         = 1500
 class VlessVpnService : VpnService() {
 
     companion object {
-        const val ACTION_START = "com.musicses.vlessvpn.START"
-        const val ACTION_STOP  = "com.musicses.vlessvpn.STOP"
+        const val ACTION_START     = "com.musicses.vlessvpn.START"
+        const val ACTION_STOP      = "com.musicses.vlessvpn.STOP"
+        const val ACTION_RECONNECT = "com.musicses.vlessvpn.RECONNECT"
         const val BROADCAST    = "com.musicses.vlessvpn.STATUS"
         const val EXTRA_STATUS = "status"
-        const val EXTRA_IN     = "bytes_in"
-        const val EXTRA_OUT    = "bytes_out"
+        const val EXTRA_IN     = "bytes_in"   // 速率 bytes/s
+        const val EXTRA_OUT    = "bytes_out"  // 速率 bytes/s
     }
 
     private var tun: ParcelFileDescriptor? = null
@@ -39,12 +40,27 @@ class VlessVpnService : VpnService() {
     private var statsThread: Thread? = null
     @Volatile private var running = false
 
+    // 累计流量，用于计算速率
     private val totalIn  = AtomicLong(0)
     private val totalOut = AtomicLong(0)
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         return when (intent?.action) {
-            ACTION_STOP -> { Log.i(TAG, "Received STOP action"); stopVpn(); stopSelf(); START_NOT_STICKY }
+            ACTION_STOP -> {
+                Log.i(TAG, "Received STOP action")
+                stopVpn(); stopSelf(); START_NOT_STICKY
+            }
+            ACTION_RECONNECT -> {
+                Log.i(TAG, "Received RECONNECT action")
+                // 先停止当前连接，再重新启动
+                Thread({
+                    stopVpn()
+                    Thread.sleep(300)
+                    startForeground(NOTIF_ID, buildNotif("Reconnecting…"))
+                    startVpnInBackground()
+                }, "VPN-Reconnect").start()
+                START_STICKY
+            }
             ACTION_START -> {
                 Log.i(TAG, "Received START action")
                 startForeground(NOTIF_ID, buildNotif("Connecting…"))
@@ -106,16 +122,21 @@ class VlessVpnService : VpnService() {
             broadcast("CONNECTED")
             updateNotif("${cfg.name} • Connected")
 
-            // ── 定时广播流量统计 ──────────────────────────────────────────────
+            // ── 定时广播速率统计（每秒采样一次差值）─────────────────────────
             val st = Thread({
+                var lastIn  = 0L
+                var lastOut = 0L
                 while (running) {
                     try { Thread.sleep(1000) } catch (_: InterruptedException) { break }
-                    if (running) {
-                        val i = totalIn.get()
-                        val o = totalOut.get()
-                        broadcastStats(i, o)
-                        updateNotif("↓ ${fmt(i)}  ↑ ${fmt(o)}")
-                    }
+                    if (!running) break
+                    val curIn  = totalIn.get()
+                    val curOut = totalOut.get()
+                    val rateIn  = curIn  - lastIn
+                    val rateOut = curOut - lastOut
+                    lastIn  = curIn
+                    lastOut = curOut
+                    broadcastStats(rateIn, rateOut)
+                    updateNotif("↓ ${fmt(rateIn)}/s  ↑ ${fmt(rateOut)}/s")
                 }
             }, "stats-timer")
             st.isDaemon = true
@@ -173,11 +194,11 @@ class VlessVpnService : VpnService() {
         sendBroadcast(Intent(BROADCAST).apply { putExtra(EXTRA_STATUS, status); setPackage(packageName) })
     }
 
-    private fun broadcastStats(bytesIn: Long, bytesOut: Long) {
+    private fun broadcastStats(rateIn: Long, rateOut: Long) {
         sendBroadcast(Intent(BROADCAST).apply {
             putExtra(EXTRA_STATUS, "CONNECTED")
-            putExtra(EXTRA_IN, bytesIn)
-            putExtra(EXTRA_OUT, bytesOut)
+            putExtra(EXTRA_IN, rateIn)
+            putExtra(EXTRA_OUT, rateOut)
             setPackage(packageName)
         })
     }

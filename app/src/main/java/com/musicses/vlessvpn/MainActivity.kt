@@ -45,8 +45,8 @@ class MainActivity : ComponentActivity() {
 
     private var vpnReceiver: BroadcastReceiver? = null
     private val _status   = mutableStateOf("DISCONNECTED")
-    private val _bytesIn  = mutableStateOf(0L)
-    private val _bytesOut = mutableStateOf(0L)
+    private val _rateIn   = mutableStateOf(0L)
+    private val _rateOut  = mutableStateOf(0L)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -54,16 +54,23 @@ class MainActivity : ComponentActivity() {
 
         vpnReceiver = object : BroadcastReceiver() {
             override fun onReceive(ctx: Context, intent: Intent) {
-                _status.value   = intent.getStringExtra(VlessVpnService.EXTRA_STATUS) ?: return
-                _bytesIn.value  = intent.getLongExtra(VlessVpnService.EXTRA_IN, _bytesIn.value)
-                _bytesOut.value = intent.getLongExtra(VlessVpnService.EXTRA_OUT, _bytesOut.value)
+                val newStatus = intent.getStringExtra(VlessVpnService.EXTRA_STATUS) ?: return
+                _status.value = newStatus
+                // 断开时速率归零
+                if (newStatus != "CONNECTED") {
+                    _rateIn.value  = 0L
+                    _rateOut.value = 0L
+                } else {
+                    _rateIn.value  = intent.getLongExtra(VlessVpnService.EXTRA_IN, 0L)
+                    _rateOut.value = intent.getLongExtra(VlessVpnService.EXTRA_OUT, 0L)
+                }
             }
         }
         registerReceiver(vpnReceiver, IntentFilter(VlessVpnService.BROADCAST), RECEIVER_NOT_EXPORTED)
 
         setContent {
             VlessVpnTheme(darkTheme = true, dynamicColor = false) {
-                MainScreen(_status, _bytesIn, _bytesOut)
+                MainScreen(_status, _rateIn, _rateOut)
             }
         }
     }
@@ -78,16 +85,16 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun MainScreen(
-    statusState:   MutableState<String>,
-    bytesInState:  MutableState<Long>,
-    bytesOutState: MutableState<Long>,
+    statusState:  MutableState<String>,
+    rateInState:  MutableState<Long>,
+    rateOutState: MutableState<Long>,
 ) {
     val ctx       = LocalContext.current
     val clipboard = LocalClipboardManager.current
 
-    val status   by statusState
-    val bytesIn  by bytesInState
-    val bytesOut by bytesOutState
+    val status  by statusState
+    val rateIn  by rateInState
+    val rateOut by rateOutState
 
     // ── 配置列表状态 ──────────────────────────────────────────────────────────
     var configs   by remember { mutableStateOf(ConfigStore.loadAll(ctx)) }
@@ -96,9 +103,8 @@ fun MainScreen(
 
     // ── 弹窗状态 ──────────────────────────────────────────────────────────────
     var showEditor   by remember { mutableStateOf(false) }
-    var editingCfg   by remember { mutableStateOf<VlessConfig?>(null) }   // null = 新增
+    var editingCfg   by remember { mutableStateOf<VlessConfig?>(null) }
     var showImport   by remember { mutableStateOf(false) }
-    var showUriPaste by remember { mutableStateOf("") }   // 粘贴框内容
 
     // ── VPN 权限 ──────────────────────────────────────────────────────────────
     val vpnLauncher = rememberLauncherForActivityResult(
@@ -114,6 +120,15 @@ fun MainScreen(
             ConfigStore.saveActiveId(ctx, activeId)
             val intent = VpnService.prepare(ctx)
             if (intent != null) vpnLauncher.launch(intent) else startVpn(ctx)
+        }
+    }
+
+    // 切换配置：保存选择，若已连接则立即重连
+    fun onSelectConfig(id: String) {
+        activeId = id
+        ConfigStore.saveActiveId(ctx, id)
+        if (status == "CONNECTED") {
+            reconnectVpn(ctx)
         }
     }
 
@@ -138,19 +153,16 @@ fun MainScreen(
             ) {
                 Text("VLESS VPN", fontSize = 24.sp, fontWeight = FontWeight.Bold,
                     color = Accent, modifier = Modifier.weight(1f))
-                // 导入按钮
                 TextButton(onClick = { showImport = true }) {
                     Text("Import", color = TextSec, fontSize = 13.sp)
                 }
-                // 新增按钮
                 IconButton(onClick = { editingCfg = null; showEditor = true }) {
-                    Icon(Icons.Default.Add, contentDescription = "Add",
-                        tint = Accent)
+                    Icon(Icons.Default.Add, contentDescription = "Add", tint = Accent)
                 }
             }
 
             // ── 状态卡片 ──────────────────────────────────────────────────────
-            StatusCard(status, bytesIn, bytesOut, ::onConnectToggle)
+            StatusCard(status, rateIn, rateOut, ::onConnectToggle)
 
             Spacer(Modifier.height(16.dp))
 
@@ -160,16 +172,16 @@ fun MainScreen(
 
             configs.forEach { cfg ->
                 ProfileRow(
-                    cfg       = cfg,
-                    isActive  = cfg.id == activeId,
+                    cfg         = cfg,
+                    isActive    = cfg.id == activeId,
                     isConnected = status == "CONNECTED" && cfg.id == activeId,
-                    onSelect  = { activeId = cfg.id; ConfigStore.saveActiveId(ctx, cfg.id) },
-                    onEdit    = { editingCfg = cfg; showEditor = true },
-                    onExport  = {
+                    onSelect    = { onSelectConfig(cfg.id) },
+                    onEdit      = { editingCfg = cfg; showEditor = true },
+                    onExport    = {
                         clipboard.setText(AnnotatedString(cfg.toVlessUri()))
                         Toast.makeText(ctx, "Copied to clipboard", Toast.LENGTH_SHORT).show()
                     },
-                    onDelete  = {
+                    onDelete    = {
                         if (configs.size > 1) {
                             val newList = configs.filter { it.id != cfg.id }
                             if (activeId == cfg.id) activeId = newList.first().id
@@ -192,9 +204,9 @@ fun MainScreen(
     // ── 编辑/新增弹窗 ──────────────────────────────────────────────────────────
     if (showEditor) {
         ProfileEditorDialog(
-            initial  = editingCfg,
+            initial   = editingCfg,
             onDismiss = { showEditor = false },
-            onSave   = { cfg ->
+            onSave    = { cfg ->
                 val newList = if (editingCfg == null) {
                     configs + cfg
                 } else {
@@ -229,12 +241,12 @@ fun MainScreen(
 // ── 状态卡片 ──────────────────────────────────────────────────────────────────
 
 @Composable
-private fun StatusCard(status: String, bytesIn: Long, bytesOut: Long, onToggle: () -> Unit) {
+private fun StatusCard(status: String, rateIn: Long, rateOut: Long, onToggle: () -> Unit) {
     val (statusText, statusColor) = when (status) {
-        "CONNECTED"  -> "● Connected"   to GreenOk
-        "CONNECTING" -> "◌ Connecting…" to OrangeWait
-        "ERROR"      -> "✕ Error"       to RedErr
-        else         -> "○ Disconnected" to TextSec
+        "CONNECTED"  -> "● Connected"    to GreenOk
+        "CONNECTING" -> "◌ Connecting…"  to OrangeWait
+        "ERROR"      -> "✕ Error"        to RedErr
+        else         -> "○ Disconnected"  to TextSec
     }
     val btnText  = if (status == "CONNECTED") "Disconnect" else "Connect"
     val btnColor = if (status == "CONNECTED") RedErr else Accent
@@ -247,8 +259,10 @@ private fun StatusCard(status: String, bytesIn: Long, bytesOut: Long, onToggle: 
             Text(statusText, color = statusColor, fontSize = 18.sp, fontWeight = FontWeight.Medium)
             if (status == "CONNECTED") {
                 Spacer(Modifier.height(4.dp))
-                Text("↓ ${fmtBytes(bytesIn)}   ↑ ${fmtBytes(bytesOut)}",
-                    color = TextSec, fontSize = 13.sp)
+                Text(
+                    "↓ ${fmtRate(rateIn)}   ↑ ${fmtRate(rateOut)}",
+                    color = TextSec, fontSize = 13.sp
+                )
             }
             Spacer(Modifier.height(16.dp))
             Button(onClick = onToggle,
@@ -279,7 +293,6 @@ private fun ProfileRow(
         modifier = Modifier.fillMaxWidth().clickable { onSelect() }) {
         Row(modifier = Modifier.fillMaxWidth().padding(12.dp),
             verticalAlignment = Alignment.CenterVertically) {
-            // 选中指示器
             Box(modifier = Modifier.size(10.dp).background(
                 if (isConnected) GreenOk else if (isActive) Accent else Color(0xFF3A3F55),
                 shape = RoundedCornerShape(50)
@@ -290,17 +303,14 @@ private fun ProfileRow(
                 Text("${cfg.server}:${cfg.port}  ${if (cfg.security == "tls") "TLS" else "WS"}",
                     color = TextSec, fontSize = 12.sp)
             }
-            // 导出（复制）
             TextButton(onClick = onExport, contentPadding = PaddingValues(0.dp),
                 modifier = Modifier.size(36.dp)) {
                 Text("⎘", color = TextSec, fontSize = 16.sp)
             }
-            // 编辑
             TextButton(onClick = onEdit, contentPadding = PaddingValues(0.dp),
                 modifier = Modifier.size(36.dp)) {
                 Text("✎", color = TextSec, fontSize = 16.sp)
             }
-            // 删除
             IconButton(onClick = onDelete, modifier = Modifier.size(36.dp)) {
                 Icon(Icons.Default.Delete, contentDescription = "Delete",
                     tint = RedErr.copy(alpha = 0.7f), modifier = Modifier.size(18.dp))
@@ -328,17 +338,16 @@ private fun ProfileEditorDialog(
     var security  by remember { mutableStateOf(initial?.security ?: "none") }
     val useTls    = security == "tls"
 
-    // 也支持直接粘贴 URI 解析
-    val clipboard = LocalClipboardManager.current
+    val clipboard  = LocalClipboardManager.current
     var pasteError by remember { mutableStateOf("") }
 
     fun fillFromUri(uri: String) {
         val cfg = VlessConfig.fromVlessUri(uri)
         if (cfg != null) {
-            name    = cfg.name;   server  = cfg.server
-            port    = cfg.port.toString(); uuid    = cfg.uuid
-            path    = cfg.path;   sni     = cfg.sni
-            wsHost  = cfg.wsHost; security = cfg.security
+            name = cfg.name; server = cfg.server
+            port = cfg.port.toString(); uuid = cfg.uuid
+            path = cfg.path; sni = cfg.sni
+            wsHost = cfg.wsHost; security = cfg.security
             pasteError = ""
         } else {
             pasteError = "Invalid VLESS URI"
@@ -358,15 +367,11 @@ private fun ProfileEditorDialog(
 
                 Spacer(Modifier.height(12.dp))
 
-                // 快速粘贴 URI 行
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("Paste VLESS URI", color = TextSec, fontSize = 12.sp,
                         modifier = Modifier.weight(1f))
                     OutlinedButton(
-                        onClick = {
-                            val text = clipboard.getText()?.text ?: ""
-                            fillFromUri(text)
-                        },
+                        onClick = { fillFromUri(clipboard.getText()?.text ?: "") },
                         border = BorderStroke(1.dp, Accent),
                         colors = ButtonDefaults.outlinedButtonColors(contentColor = Accent),
                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
@@ -386,7 +391,6 @@ private fun ProfileEditorDialog(
                 DlgField("SNI", sni, KeyboardType.Uri) { sni = it }
                 DlgField("Host Header", wsHost, KeyboardType.Uri) { wsHost = it }
 
-                // TLS 开关
                 Row(modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                     verticalAlignment = Alignment.CenterVertically) {
                     Text("Enable TLS", color = TextPri, fontSize = 14.sp,
@@ -456,7 +460,6 @@ private fun ImportDialog(onDismiss: () -> Unit, onImport: (String) -> Unit) {
                     modifier = Modifier.fillMaxWidth()
                 )
                 Spacer(Modifier.height(8.dp))
-                // 从剪贴板粘贴
                 OutlinedButton(
                     onClick = { uriText = clipboard.getText()?.text ?: "" },
                     border = BorderStroke(1.dp, TextSec),
@@ -503,10 +506,11 @@ private fun DlgField(label: String, value: String, kbd: KeyboardType, onChange: 
 
 // ── 工具函数 ──────────────────────────────────────────────────────────────────
 
-private fun fmtBytes(b: Long) = when {
-    b < 1024L    -> "${b}B"
-    b < 1048576L -> "${"%.1f".format(b / 1024.0)}K"
-    else         -> "${"%.1f".format(b / 1048576.0)}M"
+/** 格式化速率，附带 /s 单位 */
+private fun fmtRate(b: Long) = when {
+    b < 1024L    -> "${b}B/s"
+    b < 1048576L -> "${"%.1f".format(b / 1024.0)}K/s"
+    else         -> "${"%.1f".format(b / 1048576.0)}M/s"
 }
 
 private fun startVpn(ctx: Context) =
@@ -514,3 +518,6 @@ private fun startVpn(ctx: Context) =
 
 private fun stopVpn(ctx: Context) =
     ctx.startService(Intent(ctx, VlessVpnService::class.java).setAction(VlessVpnService.ACTION_STOP))
+
+private fun reconnectVpn(ctx: Context) =
+    ctx.startService(Intent(ctx, VlessVpnService::class.java).setAction(VlessVpnService.ACTION_RECONNECT))
