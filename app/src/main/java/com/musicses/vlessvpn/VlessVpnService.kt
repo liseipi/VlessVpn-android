@@ -10,6 +10,7 @@ import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import java.util.Collections
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 private const val TAG = "VlessVpnService"
@@ -30,200 +31,265 @@ class VlessVpnService : VpnService() {
         const val ACTION_RECONNECT = "com.musicses.vlessvpn.RECONNECT"
         const val BROADCAST    = "com.musicses.vlessvpn.STATUS"
         const val EXTRA_STATUS = "status"
-        const val EXTRA_IN     = "bytes_in"   // 速率 bytes/s
-        const val EXTRA_OUT    = "bytes_out"  // 速率 bytes/s
+        const val EXTRA_IN     = "bytes_in"
+        const val EXTRA_OUT    = "bytes_out"
     }
 
+    private val lock = Any()
+
+    // Protected by lock
     private var tun: ParcelFileDescriptor? = null
     private var socksServer: LocalSocks5Server? = null
     private var tun2socksThread: Thread? = null
     private var statsThread: Thread? = null
-    @Volatile private var running = false
 
-    // 累计流量，用于计算速率
+    // Atomic flags — safe to read without lock
+    private val running = AtomicBoolean(false)
+    private val userStopped = AtomicBoolean(false)   // ← NEW: user explicitly pressed Stop
+
     private val totalIn  = AtomicLong(0)
     private val totalOut = AtomicLong(0)
 
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        return when (intent?.action) {
+        val action = intent?.action
+        Log.i(TAG, "onStartCommand: $action  running=${running.get()}")
+
+        return when (action) {
             ACTION_STOP -> {
-                Log.i(TAG, "Received STOP action")
-                stopVpn(); stopSelf(); START_NOT_STICKY
-            }
-            ACTION_RECONNECT -> {
-                Log.i(TAG, "Received RECONNECT action")
-                // 先停止当前连接，再重新启动
+                userStopped.set(true)           // mark explicit stop
+                Log.i(TAG, "User requested STOP")
                 Thread({
-                    stopVpn()
-                    Thread.sleep(300)
-                    startForeground(NOTIF_ID, buildNotif("Reconnecting…"))
-                    startVpnInBackground()
+                    fullStop()
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }, "VPN-Stop").start()
+                START_NOT_STICKY                // ← do NOT restart after stop
+            }
+
+            ACTION_RECONNECT -> {
+                userStopped.set(false)
+                Log.i(TAG, "RECONNECT: stopping and restarting service")
+                Thread({
+                    fullStop()
+                    Thread.sleep(200)
+                    fullStart()
                 }, "VPN-Reconnect").start()
                 START_STICKY
             }
+
             ACTION_START -> {
-                Log.i(TAG, "Received START action")
+                userStopped.set(false)
+                if (running.get()) {
+                    Log.w(TAG, "Already running, ignoring START")
+                    return START_STICKY
+                }
                 startForeground(NOTIF_ID, buildNotif("Connecting…"))
-                startVpnInBackground()
+                Thread({ fullStart() }, "VPN-Start").start()
                 START_STICKY
             }
+
             else -> START_STICKY
         }
     }
 
-    override fun onDestroy() { Log.i(TAG, "onDestroy"); stopVpn(); super.onDestroy() }
-    override fun onRevoke()  { Log.w(TAG, "VPN revoked"); stopVpn(); super.onRevoke() }
-
-    private fun startVpnInBackground() {
-        if (running) return
-        running = true
-        Thread(::doStart, "VPN-Start").start()
+    override fun onDestroy() {
+        Log.i(TAG, "onDestroy")
+        // Only clean up if not already fully stopped
+        if (running.get()) fullStop()
+        super.onDestroy()
     }
 
-    private fun doStart() {
+    override fun onRevoke() {
+        Log.w(TAG, "VPN revoked by system")
+        userStopped.set(true)
+        Thread({ fullStop(); stopSelf() }, "VPN-Revoke").start()
+        super.onRevoke()
+    }
+
+    // ── Core start / stop ─────────────────────────────────────────────────────
+
+    private fun fullStart() {
+        // Claim running flag immediately; bail if already taken
+        if (!running.compareAndSet(false, true)) {
+            Log.w(TAG, "fullStart: already running, skipping")
+            return
+        }
+        Log.i(TAG, "===== fullStart =====")
+
         try {
-            Log.i(TAG, "========== VPN Start ==========")
             val cfg = ConfigStore.loadActive(this)
-            Log.i(TAG, "Config: ${cfg.name}  server=${cfg.server}:${cfg.port}")
+            Log.i(TAG, "Config: ${cfg.name}  ${cfg.server}:${cfg.port}")
+
             broadcast("CONNECTING")
+            startForeground(NOTIF_ID, buildNotif("Connecting…"))
 
-            VlessTunnel.getOrCreateClient(cfg, this)
-            Log.i(TAG, "✓ Protected OkHttpClient ready")
+            // Reset counters
+            totalIn.set(0); totalOut.set(0)
 
+            // Protected OkHttpClient (must be created before TUN so protect() is active)
+            VlessTunnel.clearSharedClients()
+            val client = VlessTunnel.getOrCreateClient(cfg, this)
+            Log.i(TAG, "✓ OkHttpClient ready")
+
+            // tun2socks native lib
             Tun2Socks.initialize(this)
-            Log.d(TAG, "✓ tun2socks library loaded")
 
-            // 重置流量计数
-            totalIn.set(0)
-            totalOut.set(0)
-
+            // SOCKS5 local server
             val server = LocalSocks5Server(cfg, this) { bytesIn, bytesOut ->
                 totalIn.addAndGet(bytesIn)
                 totalOut.addAndGet(bytesOut)
             }
-            socksServer = server
             val socksPort = server.start()
-            Log.i(TAG, "✓ SOCKS5 on 127.0.0.1:$socksPort")
+            Log.i(TAG, "✓ SOCKS5 on :$socksPort")
 
+            // TUN interface
             val tunPfd = Builder()
                 .setSession("VlessVPN")
                 .setMtu(MTU)
                 .addAddress(TUN_ADDR, VPN_PREFIX)
                 .addRoute("0.0.0.0", 0)
-                .addDnsServer("8.8.8.8")
-                .addDnsServer("8.8.4.4")
+                .addDnsServer(cfg.dns1)
+                .addDnsServer(cfg.dns2)
                 .addDisallowedApplication(packageName)
                 .establish()
-                ?: throw Exception("TUN establish failed")
+                ?: throw IllegalStateException("TUN establish() returned null — VPN permission denied?")
 
-            tun = tunPfd
-            Log.i(TAG, "✓ TUN established, fd=${tunPfd.fd}, addr=$TUN_ADDR/$VPN_PREFIX")
-            Log.i(TAG, "✓ VPN Connected")
+            Log.i(TAG, "✓ TUN fd=${tunPfd.fd}")
+
+            synchronized(lock) {
+                socksServer    = server
+                tun            = tunPfd
+            }
+
             broadcast("CONNECTED")
             updateNotif("${cfg.name} • Connected")
 
-            // ── 定时广播速率统计（每秒采样一次差值）─────────────────────────
+            // Stats broadcaster (1 s interval)
             val st = Thread({
-                var lastIn  = 0L
-                var lastOut = 0L
-                while (running) {
+                var lastIn = 0L; var lastOut = 0L
+                while (running.get()) {
                     try { Thread.sleep(1000) } catch (_: InterruptedException) { break }
-                    if (!running) break
-                    val curIn  = totalIn.get()
-                    val curOut = totalOut.get()
-                    val rateIn  = curIn  - lastIn
-                    val rateOut = curOut - lastOut
-                    lastIn  = curIn
-                    lastOut = curOut
-                    broadcastStats(rateIn, rateOut)
-                    updateNotif("↓ ${fmt(rateIn)}/s  ↑ ${fmt(rateOut)}/s")
+                    if (!running.get()) break
+                    val ci = totalIn.get(); val co = totalOut.get()
+                    val ri = ci - lastIn;   val ro = co - lastOut
+                    lastIn = ci; lastOut = co
+                    broadcastStats(ri, ro)
+                    updateNotif("↓ ${fmt(ri)}/s  ↑ ${fmt(ro)}/s")
                 }
-            }, "stats-timer")
-            st.isDaemon = true
-            st.start()
-            statsThread = st
+            }, "stats-timer").also { it.isDaemon = true; it.start() }
 
-            val t = Thread({
-                Log.i(TAG, "tun2socks starting → socks=127.0.0.1:$socksPort  netif=$NET_IF_ADDR")
+            synchronized(lock) { statsThread = st }
+
+            // tun2socks thread
+            val t2s = Thread({
+                Log.i(TAG, "tun2socks starting fd=${tunPfd.fd} socks=:$socksPort")
                 val ok = Tun2Socks.startTun2Socks(
                     Tun2Socks.LogLevel.NOTICE,
-                    tunPfd,
-                    MTU,
-                    "127.0.0.1",
-                    socksPort,
-                    NET_IF_ADDR,
-                    null,
-                    NETMASK,
-                    true,
-                    Collections.emptyList()
+                    tunPfd, MTU,
+                    "127.0.0.1", socksPort,
+                    NET_IF_ADDR, null, NETMASK,
+                    true, Collections.emptyList()
                 )
-                Log.i(TAG, "tun2socks exited with result: $ok")
-                if (!ok && running) { broadcast("ERROR") }
-            }, "tun2socks-main")
-            t.isDaemon = true; t.start()
-            tun2socksThread = t
+                Log.i(TAG, "tun2socks exited ok=$ok")
+                // Only broadcast ERROR if we didn't intentionally stop
+                if (!ok && running.get() && !userStopped.get()) {
+                    broadcast("ERROR")
+                }
+            }, "tun2socks-main").also { it.isDaemon = true; it.start() }
+
+            synchronized(lock) { tun2socksThread = t2s }
 
         } catch (e: Exception) {
-            Log.e(TAG, "VPN start error: ${e.message}", e)
-            broadcast("ERROR"); cleanup()
+            Log.e(TAG, "fullStart failed: ${e.message}", e)
+            running.set(false)
+            broadcast("ERROR")
+            cleanup()
         }
     }
 
-    private fun stopVpn() {
-        if (!running) return
-        running = false
-        Log.i(TAG, "Stopping VPN...")
-        statsThread?.interrupt()
-        statsThread = null
+    private fun fullStop() {
+        if (!running.compareAndSet(true, false)) {
+            Log.w(TAG, "fullStop: not running")
+            return
+        }
+        Log.i(TAG, "===== fullStop =====")
+
+        // Interrupt stats thread first (it just sleeps)
+        synchronized(lock) { statsThread?.interrupt(); statsThread = null }
+
+        // Stop tun2socks native loop
         try { Tun2Socks.stopTun2Socks() } catch (_: Exception) {}
-        tun2socksThread?.join(3000)
-        tun2socksThread = null
+        val t2s = synchronized(lock) { tun2socksThread.also { tun2socksThread = null } }
+        t2s?.join(3000)
+
         cleanup()
         broadcast("DISCONNECTED")
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        Log.i(TAG, "✓ VPN stopped")
+        Log.i(TAG, "===== fullStop done =====")
     }
 
     private fun cleanup() {
-        runCatching { socksServer?.stop() }; socksServer = null
+        val (server, tunPfd) = synchronized(lock) {
+            val s = socksServer; val t = tun
+            socksServer = null; tun = null
+            s to t
+        }
+        runCatching { server?.stop() }
         VlessTunnel.clearSharedClients()
-        runCatching { tun?.close() }; tun = null
+        runCatching { tunPfd?.close() }
     }
 
-    private fun broadcast(status: String) {
-        sendBroadcast(Intent(BROADCAST).apply { putExtra(EXTRA_STATUS, status); setPackage(packageName) })
-    }
+    // ── Broadcast helpers ─────────────────────────────────────────────────────
 
-    private fun broadcastStats(rateIn: Long, rateOut: Long) {
+    private fun broadcast(status: String) =
+        sendBroadcast(Intent(BROADCAST).apply {
+            putExtra(EXTRA_STATUS, status)
+            setPackage(packageName)
+        })
+
+    private fun broadcastStats(rateIn: Long, rateOut: Long) =
         sendBroadcast(Intent(BROADCAST).apply {
             putExtra(EXTRA_STATUS, "CONNECTED")
-            putExtra(EXTRA_IN, rateIn)
+            putExtra(EXTRA_IN,  rateIn)
             putExtra(EXTRA_OUT, rateOut)
             setPackage(packageName)
         })
-    }
+
+    // ── Notification helpers ──────────────────────────────────────────────────
 
     private fun buildNotif(text: String): Notification {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         if (nm.getNotificationChannel(CH_ID) == null)
-            nm.createNotificationChannel(NotificationChannel(CH_ID, "VPN Status", NotificationManager.IMPORTANCE_LOW))
-        val openPi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
+            nm.createNotificationChannel(
+                NotificationChannel(CH_ID, "VPN Status", NotificationManager.IMPORTANCE_LOW))
+
+        val openPi = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        val stopPi = PendingIntent.getService(this, 1,
+
+        val stopPi = PendingIntent.getService(
+            this, 1,
             Intent(this, VlessVpnService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+
         return NotificationCompat.Builder(this, CH_ID)
-            .setContentTitle("VLESS VPN").setContentText(text)
+            .setContentTitle("VLESS VPN")
+            .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_lock_lock)
-            .setContentIntent(openPi).addAction(0, "断开", stopPi).setOngoing(true).build()
+            .setContentIntent(openPi)
+            .addAction(0, "断开", stopPi)
+            .setOngoing(true)
+            .build()
     }
 
     private fun updateNotif(text: String) =
-        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(NOTIF_ID, buildNotif(text))
+        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
+            .notify(NOTIF_ID, buildNotif(text))
 
     private fun fmt(b: Long) = when {
-        b < 1024L -> "${b}B"
+        b < 1024L        -> "${b}B"
         b < 1024 * 1024L -> "${"%.1f".format(b / 1024.0)}K"
-        else -> "${"%.1f".format(b / 1048576.0)}M"
+        else             -> "${"%.1f".format(b / 1048576.0)}M"
     }
 }
