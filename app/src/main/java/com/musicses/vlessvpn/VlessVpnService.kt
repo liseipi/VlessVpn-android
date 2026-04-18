@@ -45,7 +45,7 @@ class VlessVpnService : VpnService() {
 
     // Atomic flags — safe to read without lock
     private val running = AtomicBoolean(false)
-    private val userStopped = AtomicBoolean(false)   // ← NEW: user explicitly pressed Stop
+    private val userStopped = AtomicBoolean(false)
 
     private val totalIn  = AtomicLong(0)
     private val totalOut = AtomicLong(0)
@@ -58,19 +58,21 @@ class VlessVpnService : VpnService() {
 
         return when (action) {
             ACTION_STOP -> {
-                userStopped.set(true)           // mark explicit stop
+                userStopped.set(true)
                 Log.i(TAG, "User requested STOP")
                 Thread({
                     fullStop()
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
                 }, "VPN-Stop").start()
-                START_NOT_STICKY                // ← do NOT restart after stop
+                START_NOT_STICKY
             }
 
             ACTION_RECONNECT -> {
                 userStopped.set(false)
                 Log.i(TAG, "RECONNECT: stopping and restarting service")
+                // ★ 修复：重连时立即刷新前台通知，防止系统因前台服务超时而杀进程
+                startForeground(NOTIF_ID, buildNotif("Reconnecting…"))
                 Thread({
                     fullStop()
                     Thread.sleep(200)
@@ -96,7 +98,6 @@ class VlessVpnService : VpnService() {
 
     override fun onDestroy() {
         Log.i(TAG, "onDestroy")
-        // Only clean up if not already fully stopped
         if (running.get()) fullStop()
         super.onDestroy()
     }
@@ -111,7 +112,6 @@ class VlessVpnService : VpnService() {
     // ── Core start / stop ─────────────────────────────────────────────────────
 
     private fun fullStart() {
-        // Claim running flag immediately; bail if already taken
         if (!running.compareAndSet(false, true)) {
             Log.w(TAG, "fullStart: already running, skipping")
             return
@@ -125,18 +125,14 @@ class VlessVpnService : VpnService() {
             broadcast("CONNECTING")
             startForeground(NOTIF_ID, buildNotif("Connecting…"))
 
-            // Reset counters
             totalIn.set(0); totalOut.set(0)
 
-            // Protected OkHttpClient (must be created before TUN so protect() is active)
             VlessTunnel.clearSharedClients()
             val client = VlessTunnel.getOrCreateClient(cfg, this)
             Log.i(TAG, "✓ OkHttpClient ready")
 
-            // tun2socks native lib
             Tun2Socks.initialize(this)
 
-            // SOCKS5 local server
             val server = LocalSocks5Server(cfg, this) { bytesIn, bytesOut ->
                 totalIn.addAndGet(bytesIn)
                 totalOut.addAndGet(bytesOut)
@@ -144,7 +140,6 @@ class VlessVpnService : VpnService() {
             val socksPort = server.start()
             Log.i(TAG, "✓ SOCKS5 on :$socksPort")
 
-            // TUN interface
             val tunPfd = Builder()
                 .setSession("VlessVPN")
                 .setMtu(MTU)
@@ -166,7 +161,6 @@ class VlessVpnService : VpnService() {
             broadcast("CONNECTED")
             updateNotif("${cfg.name} • Connected")
 
-            // Stats broadcaster (1 s interval)
             val st = Thread({
                 var lastIn = 0L; var lastOut = 0L
                 while (running.get()) {
@@ -182,7 +176,6 @@ class VlessVpnService : VpnService() {
 
             synchronized(lock) { statsThread = st }
 
-            // tun2socks thread
             val t2s = Thread({
                 Log.i(TAG, "tun2socks starting fd=${tunPfd.fd} socks=:$socksPort")
                 val ok = Tun2Socks.startTun2Socks(
@@ -193,7 +186,6 @@ class VlessVpnService : VpnService() {
                     true, Collections.emptyList()
                 )
                 Log.i(TAG, "tun2socks exited ok=$ok")
-                // Only broadcast ERROR if we didn't intentionally stop
                 if (!ok && running.get() && !userStopped.get()) {
                     broadcast("ERROR")
                 }
@@ -216,10 +208,8 @@ class VlessVpnService : VpnService() {
         }
         Log.i(TAG, "===== fullStop =====")
 
-        // Interrupt stats thread first (it just sleeps)
         synchronized(lock) { statsThread?.interrupt(); statsThread = null }
 
-        // Stop tun2socks native loop
         try { Tun2Socks.stopTun2Socks() } catch (_: Exception) {}
         val t2s = synchronized(lock) { tun2socksThread.also { tun2socksThread = null } }
         t2s?.join(3000)
