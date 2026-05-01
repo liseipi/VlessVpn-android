@@ -40,19 +40,15 @@ void *thread_stdout_func(void *) {
 }
 
 int start_redirecting_stdout_stderr() {
-    // Close old pipes if re-initializing, to avoid fd leak.
-    if (pipe_stdout[0] > 0) { close(pipe_stdout[0]); close(pipe_stdout[1]); }
-    if (pipe_stderr[0] > 0) { close(pipe_stderr[0]); close(pipe_stderr[1]); }
-
     setvbuf(stdout, nullptr, _IONBF, 0);
     pipe(pipe_stdout);
     dup2(pipe_stdout[1], STDOUT_FILENO);
-    close(pipe_stdout[1]); // write end now owned by STDOUT_FILENO
+    close(pipe_stdout[1]); // dup2 duplicates the fd; close the original
 
     setvbuf(stderr, nullptr, _IONBF, 0);
     pipe(pipe_stderr);
     dup2(pipe_stderr[1], STDERR_FILENO);
-    close(pipe_stderr[1]); // write end now owned by STDERR_FILENO
+    close(pipe_stderr[1]);
 
     if (pthread_create(&thread_stdout, nullptr, thread_stdout_func, nullptr) == -1) {
         return -1;
