@@ -47,6 +47,7 @@ class MainActivity : ComponentActivity() {
     private val _status   = mutableStateOf("DISCONNECTED")
     private val _rateIn   = mutableStateOf(0L)
     private val _rateOut  = mutableStateOf(0L)
+    private val _errorMsg = mutableStateOf("")
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -56,7 +57,11 @@ class MainActivity : ComponentActivity() {
             override fun onReceive(ctx: Context, intent: Intent) {
                 val newStatus = intent.getStringExtra(VlessVpnService.EXTRA_STATUS) ?: return
                 _status.value = newStatus
-                // 断开时速率归零
+                if (newStatus == "ERROR") {
+                    _errorMsg.value = intent.getStringExtra(VlessVpnService.EXTRA_ERROR) ?: "Unknown error"
+                } else {
+                    _errorMsg.value = ""
+                }
                 if (newStatus != "CONNECTED") {
                     _rateIn.value  = 0L
                     _rateOut.value = 0L
@@ -70,7 +75,7 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             VlessVpnTheme(darkTheme = true, dynamicColor = false) {
-                MainScreen(_status, _rateIn, _rateOut)
+                MainScreen(_status, _rateIn, _rateOut, _errorMsg)
             }
         }
     }
@@ -88,13 +93,15 @@ fun MainScreen(
     statusState:  MutableState<String>,
     rateInState:  MutableState<Long>,
     rateOutState: MutableState<Long>,
+    errorState:   MutableState<String>,
 ) {
     val ctx       = LocalContext.current
     val clipboard = LocalClipboardManager.current
 
-    val status  by statusState
-    val rateIn  by rateInState
-    val rateOut by rateOutState
+    val status   by statusState
+    val rateIn   by rateInState
+    val rateOut  by rateOutState
+    val errorMsg by errorState
 
     // ── 配置列表状态 ──────────────────────────────────────────────────────────
     var configs   by remember { mutableStateOf(ConfigStore.loadAll(ctx)) }
@@ -162,7 +169,7 @@ fun MainScreen(
             }
 
             // ── 状态卡片 ──────────────────────────────────────────────────────
-            StatusCard(status, rateIn, rateOut, ::onConnectToggle)
+            StatusCard(status, rateIn, rateOut, errorMsg, ::onConnectToggle)
 
             Spacer(Modifier.height(16.dp))
 
@@ -241,7 +248,7 @@ fun MainScreen(
 // ── 状态卡片 ──────────────────────────────────────────────────────────────────
 
 @Composable
-private fun StatusCard(status: String, rateIn: Long, rateOut: Long, onToggle: () -> Unit) {
+private fun StatusCard(status: String, rateIn: Long, rateOut: Long, errorMsg: String, onToggle: () -> Unit) {
     val (statusText, statusColor) = when (status) {
         "CONNECTED"  -> "● Connected"    to GreenOk
         "CONNECTING" -> "◌ Connecting…"  to OrangeWait
@@ -263,6 +270,10 @@ private fun StatusCard(status: String, rateIn: Long, rateOut: Long, onToggle: ()
                     "↓ ${fmtRate(rateIn)}   ↑ ${fmtRate(rateOut)}",
                     color = TextSec, fontSize = 13.sp
                 )
+            }
+            if (errorMsg.isNotEmpty()) {
+                Spacer(Modifier.height(4.dp))
+                Text(errorMsg, color = RedErr, fontSize = 12.sp)
             }
             Spacer(Modifier.height(16.dp))
             Button(onClick = onToggle,
@@ -417,7 +428,7 @@ private fun ProfileEditorDialog(
                             sni      = sni.trim(),
                             wsHost   = wsHost.trim(),
                             security = security,
-                            rejectUnauthorized = security != "tls",
+                            rejectUnauthorized = false,
                         )
                         onSave(cfg)
                     }, modifier = Modifier.weight(1f),

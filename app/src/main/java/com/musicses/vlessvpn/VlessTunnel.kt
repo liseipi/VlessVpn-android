@@ -68,9 +68,7 @@ class VlessTunnel(
                 override fun checkServerTrusted(c: Array<java.security.cert.X509Certificate>, a: String) {}
                 override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = emptyArray()
             }
-            val sslCtx = javax.net.ssl.SSLContext.getInstance("TLS").apply {
-                init(null, arrayOf(trustAll), java.security.SecureRandom())
-            }
+            val effectiveTM = if (cfg.rejectUnauthorized) null else trustAll
 
             val dns = ProtectedDns(cfg.server, vpnService)
 
@@ -80,9 +78,12 @@ class VlessTunnel(
                 .writeTimeout(60, TimeUnit.SECONDS)
                 .pingInterval(25, TimeUnit.SECONDS)
                 .connectionPool(ConnectionPool(10, 5, TimeUnit.MINUTES))
-                .hostnameVerifier { _, _ -> true }
                 .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
                 .dns(dns)
+
+            if (!cfg.rejectUnauthorized) {
+                builder.hostnameVerifier { _, _ -> true }
+            }
 
             if (vpnService != null) {
                 val factory = object : javax.net.SocketFactory() {
@@ -102,9 +103,19 @@ class VlessTunnel(
                     override fun createSocket(h: InetAddress, p: Int, la: InetAddress?, lp: Int) = p(def.createSocket(h, p, la, lp))
                 }
                 builder.socketFactory(factory)
-                builder.sslSocketFactory(sslCtx.socketFactory, trustAll)
+                if (effectiveTM != null) {
+                    val sslCtx = javax.net.ssl.SSLContext.getInstance("TLS").apply {
+                        init(null, arrayOf(effectiveTM), java.security.SecureRandom())
+                    }
+                    builder.sslSocketFactory(sslCtx.socketFactory, effectiveTM)
+                }
             } else {
-                builder.sslSocketFactory(sslCtx.socketFactory, trustAll)
+                if (effectiveTM != null) {
+                    val sslCtx = javax.net.ssl.SSLContext.getInstance("TLS").apply {
+                        init(null, arrayOf(effectiveTM), java.security.SecureRandom())
+                    }
+                    builder.sslSocketFactory(sslCtx.socketFactory, effectiveTM)
+                }
                 Log.w(TAG, "Building OkHttpClient WITHOUT protect (emulator mode)")
             }
 
@@ -281,8 +292,8 @@ class VlessTunnel(
                     } else {
                         while (pos < len) {
                             val b = buf[pos].toInt() and 0xFF
-                            if (b and 0xC0 == 0xC0) { pos += 2; return@repeat }
-                            if (b == 0)             { pos++;    break          }
+                            if (b and 0xC0 == 0xC0) { pos += 2; break }
+                            if (b == 0)             { pos++;    break }
                             pos += b + 1
                         }
                     }
@@ -335,10 +346,16 @@ class VlessTunnel(
                 deliver(true)
             }
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                if (!closed.get() && bytes.size > 0) inQueue.offer(bytes.toByteArray())
+                if (!closed.get() && bytes.size > 0) {
+                    try { inQueue.put(bytes.toByteArray()) }
+                    catch (_: InterruptedException) { Thread.currentThread().interrupt() }
+                }
             }
             override fun onMessage(webSocket: WebSocket, text: String) {
-                if (!closed.get() && text.isNotEmpty()) inQueue.offer(text.toByteArray())
+                if (!closed.get() && text.isNotEmpty()) {
+                    try { inQueue.put(text.toByteArray()) }
+                    catch (_: InterruptedException) { Thread.currentThread().interrupt() }
+                }
             }
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 Log.d(TAG, "WS closing: $code $reason")
@@ -406,6 +423,7 @@ class VlessTunnel(
             } finally {
                 wsDownDone.set(true); relayDone.set(true)
                 runCatching { localOut.close() }
+                runCatching { localIn.close() }
             }
         }, "VT-ws2l-$destPort").also { it.isDaemon = true }
 

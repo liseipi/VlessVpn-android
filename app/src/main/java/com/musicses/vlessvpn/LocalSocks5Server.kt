@@ -9,7 +9,8 @@ import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.CountDownLatch
-import java.util.concurrent.SynchronousQueue
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -22,7 +23,7 @@ class LocalSocks5Server(
     private val onTransfer: (bytesIn: Long, bytesOut: Long) -> Unit = { _, _ -> }
 ) {
     private val pool = ThreadPoolExecutor(
-        4, 256, 60L, TimeUnit.SECONDS, SynchronousQueue()
+        4, 256, 60L, TimeUnit.SECONDS, LinkedBlockingQueue(128)
     ).also { it.prestartCoreThread() }
 
     private lateinit var srv: ServerSocket
@@ -54,7 +55,12 @@ class LocalSocks5Server(
             try {
                 val client = srv.accept()
                 val id = connectionCount.incrementAndGet()
-                pool.submit { handleClient(client, id) }
+                try {
+                    pool.submit { handleClient(client, id) }
+                } catch (e: RejectedExecutionException) {
+                    Log.w(TAG, "[$id] Pool full, dropping connection: ${e.message}")
+                    runCatching { client.close() }
+                }
             } catch (e: Exception) {
                 if (running) Log.e(TAG, "Accept error: ${e.message}")
                 break
@@ -181,7 +187,11 @@ class LocalSocks5Server(
                     val pkt = DatagramPacket(buf, buf.size)
                     udpSock.receive(pkt)
                     val data = buf.copyOfRange(pkt.offset, pkt.offset + pkt.length)
-                    pool.submit { relayUdpPacket(connId, pkt, data, udpSock) }
+                    try {
+                        pool.submit { relayUdpPacket(connId, pkt, data, udpSock) }
+                    } catch (e: RejectedExecutionException) {
+                        Log.w(TAG, "[$connId] Pool full, dropping UDP packet")
+                    }
                 } catch (_: java.net.SocketTimeoutException) {
                 } catch (e: Exception) {
                     if (running && !controlSock.isClosed) Log.d(TAG, "[$connId] UDP recv: ${e.message}")
@@ -230,6 +240,11 @@ class LocalSocks5Server(
                     val port = ((rawData[5 + len].toInt() and 0xFF) shl 8) or (rawData[6 + len].toInt() and 0xFF)
                     Triple(host, port, 7 + len)
                 }
+                0x04 -> {
+                    val ip = InetAddress.getByAddress(rawData.copyOfRange(4, 20)).hostAddress!!
+                    val port = ((rawData[20].toInt() and 0xFF) shl 8) or (rawData[21].toInt() and 0xFF)
+                    Triple(ip, port, 22)
+                }
                 else -> return
             }
         } catch (e: Exception) { return }
@@ -256,7 +271,7 @@ class LocalSocks5Server(
             }
 
             val responseBytes = readTunnelResponse(tunnel, isDns)
-            tunnel.close()
+            // readTunnelResponse closes the tunnel in its finally block.
 
             if (responseBytes == null || responseBytes.isEmpty()) return
             Log.d(TAG, "[$connId] UDP pkt ← $dstHost:$dstPort (${responseBytes.size}B)")

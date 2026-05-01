@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
 import android.util.Log
@@ -33,6 +34,7 @@ class VlessVpnService : VpnService() {
         const val EXTRA_STATUS = "status"
         const val EXTRA_IN     = "bytes_in"
         const val EXTRA_OUT    = "bytes_out"
+        const val EXTRA_ERROR  = "error"
     }
 
     private val lock = Any()
@@ -72,7 +74,8 @@ class VlessVpnService : VpnService() {
                 userStopped.set(false)
                 Log.i(TAG, "RECONNECT: stopping and restarting service")
                 // ★ 修复：重连时立即刷新前台通知，防止系统因前台服务超时而杀进程
-                startForeground(NOTIF_ID, buildNotif("Reconnecting…"))
+                startForeground(NOTIF_ID, buildNotif("Reconnecting…"),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
                 Thread({
                     fullStop()
                     Thread.sleep(200)
@@ -87,7 +90,8 @@ class VlessVpnService : VpnService() {
                     Log.w(TAG, "Already running, ignoring START")
                     return START_STICKY
                 }
-                startForeground(NOTIF_ID, buildNotif("Connecting…"))
+                startForeground(NOTIF_ID, buildNotif("Connecting…"),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
                 Thread({ fullStart() }, "VPN-Start").start()
                 START_STICKY
             }
@@ -123,7 +127,8 @@ class VlessVpnService : VpnService() {
             Log.i(TAG, "Config: ${cfg.name}  ${cfg.server}:${cfg.port}")
 
             broadcast("CONNECTING")
-            startForeground(NOTIF_ID, buildNotif("Connecting…"))
+            startForeground(NOTIF_ID, buildNotif("Connecting…"),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
 
             totalIn.set(0); totalOut.set(0)
 
@@ -145,6 +150,7 @@ class VlessVpnService : VpnService() {
                 .setMtu(MTU)
                 .addAddress(TUN_ADDR, VPN_PREFIX)
                 .addRoute("0.0.0.0", 0)
+                .addRoute("::", 0)
                 .addDnsServer(cfg.dns1)
                 .addDnsServer(cfg.dns2)
                 .addDisallowedApplication(packageName)
@@ -187,7 +193,7 @@ class VlessVpnService : VpnService() {
                 )
                 Log.i(TAG, "tun2socks exited ok=$ok")
                 if (!ok && running.get() && !userStopped.get()) {
-                    broadcast("ERROR")
+                    broadcast("ERROR", "tun2socks exited abnormally")
                 }
             }, "tun2socks-main").also { it.isDaemon = true; it.start() }
 
@@ -196,7 +202,7 @@ class VlessVpnService : VpnService() {
         } catch (e: Exception) {
             Log.e(TAG, "fullStart failed: ${e.message}", e)
             running.set(false)
-            broadcast("ERROR")
+            broadcast("ERROR", e.message)
             cleanup()
         }
     }
@@ -232,9 +238,10 @@ class VlessVpnService : VpnService() {
 
     // ── Broadcast helpers ─────────────────────────────────────────────────────
 
-    private fun broadcast(status: String) =
+    private fun broadcast(status: String, error: String? = null) =
         sendBroadcast(Intent(BROADCAST).apply {
             putExtra(EXTRA_STATUS, status)
+            if (error != null) putExtra(EXTRA_ERROR, error)
             setPackage(packageName)
         })
 
@@ -268,7 +275,7 @@ class VlessVpnService : VpnService() {
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_lock_lock)
             .setContentIntent(openPi)
-            .addAction(0, "断开", stopPi)
+            .addAction(0, getString(R.string.disconnect), stopPi)
             .setOngoing(true)
             .build()
     }
