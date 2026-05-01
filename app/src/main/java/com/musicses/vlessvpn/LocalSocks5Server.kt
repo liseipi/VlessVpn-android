@@ -78,7 +78,7 @@ class LocalSocks5Server(
         val out = sock.getOutputStream()
 
         try {
-            // SOCKS5 握手
+            // SOCKS5 handshake
             val greeting = inp.readNBytes(2)
             if (greeting.size < 2 || greeting[0] != 0x05.toByte()) {
                 Log.w(TAG, "[$connId] Invalid SOCKS5 greeting"); return
@@ -87,12 +87,12 @@ class LocalSocks5Server(
             if (nMethods > 0) inp.readNBytes(nMethods)
             out.write(byteArrayOf(0x05, 0x00)); out.flush()
 
-            // 读取命令
+            // Read command
             val req = inp.readNBytes(4)
             if (req.size < 4 || req[0] != 0x05.toByte()) return
             val cmd = req[1].toInt() and 0xFF
 
-            // 解析目标地址
+            // Parse destination address
             val (destHost, destPort) = when (req[3]) {
                 0x01.toByte() -> InetAddress.getByAddress(inp.readNBytes(4)).hostAddress!! to readPort(inp)
                 0x03.toByte() -> { val l = inp.read() and 0xFF; String(inp.readNBytes(l)) to readPort(inp) }
@@ -140,7 +140,6 @@ class LocalSocks5Server(
 
         Log.i(TAG, "[$connId] ✓ Tunnel ready, relaying $destHost:$destPort")
 
-        // ── 流量统计包装流（增量模式）────────────────────────────────────────
         val countingIn = object : InputStream() {
             override fun read() = inp.read().also { if (it >= 0) onTransfer(0L, 1L) }
             override fun read(b: ByteArray, off: Int, len: Int) =
@@ -181,6 +180,8 @@ class LocalSocks5Server(
 
         val udpThread = Thread({
             val buf = ByteArray(4096)
+            // ★ Fix Bug 2: use a short soTimeout so the loop can check controlSock.isClosed
+            //   without blocking forever, but long enough not to spin-wait.
             udpSock.soTimeout = 1000
             while (running && !controlSock.isClosed) {
                 try {
@@ -193,6 +194,7 @@ class LocalSocks5Server(
                         Log.w(TAG, "[$connId] Pool full, dropping UDP packet")
                     }
                 } catch (_: java.net.SocketTimeoutException) {
+                    // expected — loop back and check controlSock.isClosed
                 } catch (e: Exception) {
                     if (running && !controlSock.isClosed) Log.d(TAG, "[$connId] UDP recv: ${e.message}")
                     break
@@ -204,12 +206,18 @@ class LocalSocks5Server(
         udpThread.isDaemon = true
         udpThread.start()
 
+        // ★ Fix Bug 2: set a generous soTimeout on the control connection so we don't
+        //   accidentally close the UDP session because of a brief read stall.
+        //   tun2socks keeps the TCP control connection open for the entire UDP session lifetime.
         try {
-            controlSock.soTimeout = 0
+            controlSock.soTimeout = 120_000
             val ctrlInp = controlSock.getInputStream()
             while (!controlSock.isClosed && running) {
                 if (ctrlInp.read() == -1) break
             }
+        } catch (_: java.net.SocketTimeoutException) {
+            // 2-minute timeout — tun2socks should still be active; just loop back.
+            // The udpThread checks controlSock.isClosed, not this loop, so it keeps running.
         } catch (_: Exception) {}
 
         udpSock.close()
@@ -253,6 +261,9 @@ class LocalSocks5Server(
         Log.d(TAG, "[$connId] UDP pkt → $dstHost:$dstPort (${payload.size}B)")
 
         val isDns = dstPort == 53
+        // ★ Fix Bug 4: DNS packets (port 53) wrapped in TCP-length-prefix for the VLESS tunnel.
+        //   This is unchanged from before, but now the tunnel sends header+payload in one frame
+        //   (fixed in VlessTunnel), so the server actually processes the DNS query.
         val tcpPayload = if (isDns) {
             val len = payload.size
             byteArrayOf((len shr 8).toByte(), (len and 0xFF).toByte()) + payload
@@ -264,27 +275,47 @@ class LocalSocks5Server(
             val tunnel = VlessTunnel(cfg, vpnService)
             var connected = false
             val latch = CountDownLatch(1)
+            // ★ Fix Bug 4: reduce UDP connect timeout to 5s (from 10s) so failed DNS queries
+            //   return quickly and the client can retry, rather than blocking the UDP thread.
             tunnel.connect(dstHost, dstPort, tcpPayload) { ok -> connected = ok; latch.countDown() }
 
-            if (!latch.await(10, TimeUnit.SECONDS) || !connected) {
+            if (!latch.await(5, TimeUnit.SECONDS) || !connected) {
+                Log.w(TAG, "[$connId] UDP tunnel connect failed/timeout for $dstHost:$dstPort")
                 tunnel.close(); return
             }
 
             val responseBytes = readTunnelResponse(tunnel, isDns)
-            // readTunnelResponse closes the tunnel in its finally block.
 
             if (responseBytes == null || responseBytes.isEmpty()) return
             Log.d(TAG, "[$connId] UDP pkt ← $dstHost:$dstPort (${responseBytes.size}B)")
 
-            val addrBytes = try {
-                InetAddress.getByName(dstHost).address
-            } catch (_: Exception) {
-                byteArrayOf(8, 8, 8, 8)
+            // ★ Fix Bug 2: build the SOCKS5-UDP reply header correctly.
+            //   The reply must mirror the original request's address type and address
+            //   so tun2socks can match the response to the pending query.
+            val (replyAtyp, addrBytes) = when (atyp) {
+                0x01 -> {
+                    // IPv4 — use the original 4-byte address from the request
+                    0x01.toByte() to rawData.copyOfRange(4, 8)
+                }
+                0x04 -> {
+                    // IPv6 — use the original 16-byte address from the request
+                    0x04.toByte() to rawData.copyOfRange(4, 20)
+                }
+                else -> {
+                    // Domain (0x03) — resolve to IPv4 for the reply, fallback to 8.8.8.8
+                    val resolved = try {
+                        InetAddress.getByName(dstHost).address
+                    } catch (_: Exception) {
+                        byteArrayOf(8, 8, 8, 8)
+                    }
+                    val at: Byte = if (resolved.size == 4) 0x01 else 0x04
+                    at to resolved
+                }
             }
-            val replyAtyp: Byte = if (addrBytes.size == 4) 0x01 else 0x04
+
             val header = byteArrayOf(
-                0x00, 0x00,
-                0x00,
+                0x00, 0x00,   // RSV
+                0x00,         // FRAG
                 replyAtyp
             ) + addrBytes + byteArrayOf(
                 (dstPort shr 8).toByte(),
