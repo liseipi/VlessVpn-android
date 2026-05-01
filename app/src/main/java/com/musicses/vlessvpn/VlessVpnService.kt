@@ -18,14 +18,11 @@ private const val TAG = "VlessVpnService"
 private const val CH_ID = "vless_vpn"
 private const val NOTIF_ID = 1
 
-private const val TUN_ADDR     = "10.0.0.2"
-private const val NET_IF_ADDR  = "10.0.0.1"
-private const val TUN_ADDR6    = "fd00::2"
-private const val NET_IF_ADDR6 = "fd00::1"
-private const val VPN_PREFIX   = 24
-private const val VPN_PREFIX6  = 120
-private const val NETMASK      = "255.255.255.0"
-private const val MTU          = 1500
+private const val TUN_ADDR    = "10.0.0.2"
+private const val NET_IF_ADDR = "10.0.0.1"
+private const val VPN_PREFIX  = 24
+private const val NETMASK     = "255.255.255.0"
+private const val MTU         = 1500
 
 class VlessVpnService : VpnService() {
 
@@ -152,7 +149,6 @@ class VlessVpnService : VpnService() {
                 .setSession("VlessVPN")
                 .setMtu(MTU)
                 .addAddress(TUN_ADDR, VPN_PREFIX)
-                .addAddress(TUN_ADDR6, VPN_PREFIX6)
                 .addRoute("0.0.0.0", 0)
                 .addRoute("::", 0)
                 .addDnsServer(cfg.dns1)
@@ -192,7 +188,7 @@ class VlessVpnService : VpnService() {
                     Tun2Socks.LogLevel.NOTICE,
                     tunPfd, MTU,
                     "127.0.0.1", socksPort,
-                    NET_IF_ADDR, NET_IF_ADDR6, NETMASK,
+                    NET_IF_ADDR, null, NETMASK,
                     true, Collections.emptyList()
                 )
                 Log.i(TAG, "tun2socks exited ok=$ok")

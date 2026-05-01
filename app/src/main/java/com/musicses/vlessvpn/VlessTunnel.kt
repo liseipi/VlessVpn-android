@@ -32,9 +32,6 @@ class VlessTunnel(
     private var destHost   = ""
     private var destPort   = 0
 
-    // ★ Fix Bug 1: store earlyData here, send together with header+first-payload in relay()
-    @Volatile private var pendingEarlyData: ByteArray? = null
-
     companion object {
         val END_MARKER = ByteArray(0)
 
@@ -126,8 +123,23 @@ class VlessTunnel(
         }
 
         // ── ProtectedDns ──────────────────────────────────────────────────────
+        /**
+         * Resolves the VLESS server hostname via a VpnService-protected UDP socket,
+         * completely bypassing the TUN interface.
+         *
+         * Design decisions:
+         * - globalIpCache persists across VpnService instances (companion object level).
+         *   This lets Session 2 reuse Session 1's resolved IPs instantly.
+         * - Two DNS servers queried IN PARALLEL with 2 s timeout each; first reply wins.
+         * - NO fallback to system InetAddress — that would go through the VPN and loop.
+         *   Instead we throw UnknownHostException so OkHttp fails fast.
+         * - On failure we still try the globalIpCache (stale but better than nothing).
+         * - All hostnames other than the server's own are passed to the SYSTEM resolver
+         *   (they are proxy targets and SHOULD go through the VPN).
+         */
         private val globalIpCache = ConcurrentHashMap<String, List<InetAddress>>()
 
+        // Call this when you want to force re-resolve on next use (e.g. after a long break).
         fun clearDnsCache() {
             globalIpCache.clear()
             Log.i(TAG, "ProtectedDns global cache cleared")
@@ -138,32 +150,41 @@ class VlessTunnel(
             private val vpnService: VpnService?
         ) : Dns {
 
+            // Per-client cache (fast path after first resolution this session).
             @Volatile private var sessionCache: List<InetAddress>? = null
 
             override fun lookup(hostname: String): List<InetAddress> {
+                // Non-server hostnames go through system resolver (they're proxy targets).
                 if (hostname != serverHost) return Dns.SYSTEM.lookup(hostname)
 
+                // 1. Fast path: session-level cache (set once, then lock-free reads).
                 sessionCache?.let { return it }
 
                 return synchronized(this) {
+                    // Re-check inside lock.
                     sessionCache?.let { return it }
 
+                    // 2. Global cache: use result from a previous VpnService session.
                     val global = globalIpCache[serverHost]
+
                     val resolved = tryResolveProtected(vpnService)
 
                     when {
                         resolved != null -> {
+                            // Fresh resolution succeeded.
                             Log.i(TAG, "ProtectedDns: $serverHost → ${resolved.map { it.hostAddress }}")
                             globalIpCache[serverHost] = resolved
                             sessionCache = resolved
                             resolved
                         }
                         global != null -> {
+                            // Fresh resolution failed but we have a cached result.
                             Log.w(TAG, "ProtectedDns: resolution failed, using cached ${global.map { it.hostAddress }}")
                             sessionCache = global
                             global
                         }
                         else -> {
+                            // Completely unable to resolve — fail fast so OkHttp fires onFailure().
                             throw UnknownHostException(
                                 "ProtectedDns: could not resolve $serverHost (no cache, no response)"
                             )
@@ -172,8 +193,13 @@ class VlessTunnel(
                 }
             }
 
+            /**
+             * Returns a non-empty list on success, null on any failure.
+             * Queries 8.8.8.8 and 8.8.4.4 in parallel; first valid reply wins.
+             */
             private fun tryResolveProtected(vpnService: VpnService?): List<InetAddress>? {
                 if (vpnService == null) {
+                    // Emulator mode: no VPN, system resolver is safe.
                     return runCatching { Dns.SYSTEM.lookup(serverHost).takeIf { it.isNotEmpty() } }
                         .getOrNull()
                 }
@@ -192,13 +218,14 @@ class VlessTunnel(
                             vpnService.protect(sock)
                             sock.soTimeout = TIMEOUT_MS.toInt()
                             try {
-                                val dest = InetAddress.getByName(dnsIp)
+                                val dest = InetAddress.getByName(dnsIp)  // numeric IP, no DNS needed
                                 sock.send(DatagramPacket(query, query.size, dest, 53))
                                 val buf = ByteArray(512)
                                 val pkt = DatagramPacket(buf, buf.size)
                                 sock.receive(pkt)
                                 val addrs = parseDnsARecords(buf, pkt.length)
                                 if (addrs.isNotEmpty()) {
+                                    // First valid reply wins — subsequent threads will see result != null
                                     result.compareAndSet(null, addrs)
                                 }
                             } finally {
@@ -213,25 +240,31 @@ class VlessTunnel(
                 }
 
                 threads.forEach { it.start() }
+
+                // Wait for both to finish (or timeout + a small grace period).
                 latch.await(TIMEOUT_MS + 500, TimeUnit.MILLISECONDS)
+
+                // Interrupt any still-running threads.
                 threads.forEach { it.interrupt() }
 
                 return result.get()
             }
 
+            // ── DNS wire format helpers ────────────────────────────────────────
+
             private fun buildDnsQuery(hostname: String): ByteArray {
                 val out = ByteArrayOutputStream()
-                out.write(0x12); out.write(0x34)
-                out.write(0x01); out.write(0x00)
-                out.write(0x00); out.write(0x01)
-                repeat(6) { out.write(0x00) }
+                out.write(0x12); out.write(0x34)   // txid
+                out.write(0x01); out.write(0x00)   // flags: RD=1
+                out.write(0x00); out.write(0x01)   // qdcount=1
+                repeat(6) { out.write(0x00) }      // ancount/nscount/arcount=0
                 hostname.split(".").forEach { label ->
                     out.write(label.length)
                     out.write(label.toByteArray())
                 }
-                out.write(0x00)
-                out.write(0x00); out.write(0x01)
-                out.write(0x00); out.write(0x01)
+                out.write(0x00)                    // root label
+                out.write(0x00); out.write(0x01)   // QTYPE=A
+                out.write(0x00); out.write(0x01)   // QCLASS=IN
                 return out.toByteArray()
             }
 
@@ -241,6 +274,7 @@ class VlessTunnel(
                 val anCount = ((buf[6].toInt() and 0xFF) shl 8) or (buf[7].toInt() and 0xFF)
                 if (anCount == 0) return result
 
+                // Skip header (12 bytes) + question section.
                 var pos = 12
                 while (pos < len) {
                     val b = buf[pos].toInt() and 0xFF
@@ -248,10 +282,11 @@ class VlessTunnel(
                     if (b == 0)             { pos++;    break }
                     pos += b + 1
                 }
-                pos += 4
+                pos += 4  // skip QTYPE + QCLASS
 
                 repeat(anCount) {
                     if (pos >= len) return@repeat
+                    // Skip NAME (pointer or labels).
                     if (buf[pos].toInt() and 0xC0 == 0xC0) {
                         pos += 2
                     } else {
@@ -302,19 +337,12 @@ class VlessTunnel(
         val resultSent = AtomicBoolean(false)
         fun deliver(ok: Boolean) { if (resultSent.compareAndSet(false, true)) onResult(ok) }
 
-        // ★ Fix Bug 1: save earlyData for relay() to send together with header+first-payload.
-        //   Do NOT call sendFirstPacket() in onOpen — that sends an empty-payload header frame
-        //   which many VLESS servers (Xray/V2Ray) reject, closing the connection immediately.
-        if (earlyData != null && earlyData.isNotEmpty()) {
-            pendingEarlyData = earlyData
-        }
-
         client.newWebSocket(req, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 if (closed.get()) { webSocket.cancel(); deliver(false); return }
                 if (!wsRef.compareAndSet(null, webSocket)) { webSocket.cancel(); deliver(false); return }
                 Log.i(TAG, "✓ WS opened [${response.protocol}]")
-                // ★ Fix Bug 1: no sendFirstPacket here — relay() handles first frame
+                sendFirstPacket(webSocket, earlyData)
                 deliver(true)
             }
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
@@ -357,7 +385,7 @@ class VlessTunnel(
 
         var respSkipped = false
         var respHdrSize = -1
-        val respBuf     = ByteArrayOutputStream(256)
+        var respBuf     = ByteArray(0)
         val relayDone   = AtomicBoolean(false)
         val wsDownDone  = AtomicBoolean(false)
 
@@ -371,14 +399,15 @@ class VlessTunnel(
                     val payload: ByteArray? = if (respSkipped) {
                         chunk
                     } else {
-                        respBuf.write(chunk)
-                        val buf = respBuf.toByteArray()
-                        if (buf.size < 2) continue
-                        if (respHdrSize == -1) respHdrSize = 2 + (buf[1].toInt() and 0xFF)
-                        if (buf.size < respHdrSize) continue
+                        respBuf = respBuf + chunk
+                        if (respBuf.size < 2) continue
+                        if (respHdrSize == -1) respHdrSize = 2 + (respBuf[1].toInt() and 0xFF)
+                        if (respBuf.size < respHdrSize) continue
                         respSkipped = true
-                        respBuf.reset()
-                        if (buf.size > respHdrSize) buf.copyOfRange(respHdrSize, buf.size) else null
+                        val p = if (respBuf.size > respHdrSize)
+                            respBuf.copyOfRange(respHdrSize, respBuf.size) else null
+                        respBuf = ByteArray(0)
+                        p
                     }
                     if (payload != null && payload.isNotEmpty()) {
                         try { localOut.write(payload); localOut.flush() }
@@ -399,9 +428,6 @@ class VlessTunnel(
         }, "VT-ws2l-$destPort").also { it.isDaemon = true }
 
         // local → WS (upstream)
-        // ★ Fix Bug 1: first write = VLESS header + pendingEarlyData (if any) + first read chunk.
-        //   This guarantees header and payload are in the same WebSocket frame, which is required
-        //   by Xray/V2Ray VLESS implementations.
         val t2 = Thread({
             try {
                 val buf = ByteArray(32768)
@@ -413,22 +439,12 @@ class VlessTunnel(
                         break
                     }
                     if (n < 0) break
-
-                    val bs: ByteString = if (!headerSent.getAndSet(true)) {
-                        // First frame: header + optional earlyData + current read chunk
-                        val header = VlessProtocol.buildHeader(cfg.uuid, destHost, destPort)
-                        val early  = pendingEarlyData
-                        pendingEarlyData = null
-                        when {
-                            early != null && early.isNotEmpty() ->
-                                (header + early + buf.copyOf(n)).toByteString()
-                            else ->
-                                (header + buf.copyOf(n)).toByteString()
-                        }
+                    val bs: ByteString = if (!headerSent.get()) {
+                        headerSent.set(true)
+                        (VlessProtocol.buildHeader(cfg.uuid, destHost, destPort) + buf.copyOf(n)).toByteString()
                     } else {
                         buf.toByteString(0, n)
                     }
-
                     if (!myWs.send(bs)) {
                         if (!wsDownDone.get()) Log.d(TAG, "local→WS: send=false")
                         break
@@ -465,5 +481,12 @@ class VlessTunnel(
             .encodedPath(cfg.wsPathPart.ifBlank { "/" })
             .also { b -> cfg.wsQueryPart?.let { b.encodedQuery(it) } }
             .build()
+    }
+
+    private fun sendFirstPacket(webSocket: WebSocket, earlyData: ByteArray?) {
+        if (headerSent.getAndSet(true)) return
+        val header = VlessProtocol.buildHeader(cfg.uuid, destHost, destPort)
+        val packet = if (earlyData != null && earlyData.isNotEmpty()) header + earlyData else header
+        webSocket.send(packet.toByteString())
     }
 }
