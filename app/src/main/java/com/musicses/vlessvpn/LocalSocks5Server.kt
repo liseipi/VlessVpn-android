@@ -8,6 +8,7 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.RejectedExecutionException
@@ -29,6 +30,7 @@ class LocalSocks5Server(
     private lateinit var srv: ServerSocket
 
     private val connectionCount = AtomicInteger(0)
+    private val activeTunnels = ConcurrentHashMap.newKeySet<VlessTunnel>()
 
     @Volatile var port: Int = 0; private set
     @Volatile private var running = false
@@ -46,6 +48,8 @@ class LocalSocks5Server(
         if (!running) return
         running = false
         runCatching { srv.close() }
+        activeTunnels.forEach { it.close() }
+        activeTunnels.clear()
         pool.shutdownNow()
         pool.awaitTermination(3, TimeUnit.SECONDS)
     }
@@ -129,36 +133,41 @@ class LocalSocks5Server(
         if (earlyData != null) Log.d(TAG, "[$connId] earlyData: ${earlyData.size}B")
 
         val tunnel = VlessTunnel(cfg, vpnService)
-        var connected = false
-        val latch = CountDownLatch(1)
-        tunnel.connect(destHost, destPort, earlyData) { ok -> connected = ok; latch.countDown() }
+        activeTunnels.add(tunnel)
+        try {
+            var connected = false
+            val latch = CountDownLatch(1)
+            tunnel.connect(destHost, destPort, earlyData) { ok -> connected = ok; latch.countDown() }
 
-        if (!latch.await(30, TimeUnit.SECONDS)) {
-            Log.e(TAG, "[$connId] Tunnel timeout"); tunnel.close(); return
-        }
-        if (!connected) { Log.e(TAG, "[$connId] Tunnel failed"); tunnel.close(); return }
-
-        Log.i(TAG, "[$connId] ✓ Tunnel ready, relaying $destHost:$destPort")
-
-        // ── 流量统计包装流（增量模式）────────────────────────────────────────
-        val countingIn = object : InputStream() {
-            override fun read() = inp.read().also { if (it >= 0) onTransfer(0L, 1L) }
-            override fun read(b: ByteArray, off: Int, len: Int) =
-                inp.read(b, off, len).also { n -> if (n > 0) onTransfer(0L, n.toLong()) }
-            override fun available() = inp.available()
-            override fun close() = inp.close()
-        }
-
-        val countingOut = object : java.io.OutputStream() {
-            override fun write(b: Int) { out.write(b); onTransfer(1L, 0L) }
-            override fun write(b: ByteArray, off: Int, len: Int) {
-                out.write(b, off, len); onTransfer(len.toLong(), 0L)
+            if (!latch.await(30, TimeUnit.SECONDS)) {
+                Log.e(TAG, "[$connId] Tunnel timeout"); tunnel.close(); return
             }
-            override fun flush() = out.flush()
-            override fun close() = out.close()
-        }
+            if (!connected) { Log.e(TAG, "[$connId] Tunnel failed"); tunnel.close(); return }
 
-        tunnel.relay(countingIn, countingOut)
+            Log.i(TAG, "[$connId] ✓ Tunnel ready, relaying $destHost:$destPort")
+
+            // ── 流量统计包装流（增量模式）────────────────────────────────────────
+            val countingIn = object : InputStream() {
+                override fun read() = inp.read().also { if (it >= 0) onTransfer(0L, 1L) }
+                override fun read(b: ByteArray, off: Int, len: Int) =
+                    inp.read(b, off, len).also { n -> if (n > 0) onTransfer(0L, n.toLong()) }
+                override fun available() = inp.available()
+                override fun close() = inp.close()
+            }
+
+            val countingOut = object : java.io.OutputStream() {
+                override fun write(b: Int) { out.write(b); onTransfer(1L, 0L) }
+                override fun write(b: ByteArray, off: Int, len: Int) {
+                    out.write(b, off, len); onTransfer(len.toLong(), 0L)
+                }
+                override fun flush() = out.flush()
+                override fun close() = out.close()
+            }
+
+            tunnel.relay(countingIn, countingOut)
+        } finally {
+            activeTunnels.remove(tunnel)
+        }
     }
 
     // ── UDP ASSOCIATE ─────────────────────────────────────────────────────────
@@ -262,19 +271,21 @@ class LocalSocks5Server(
 
         try {
             val tunnel = VlessTunnel(cfg, vpnService)
-            var connected = false
-            val latch = CountDownLatch(1)
-            tunnel.connect(dstHost, dstPort, tcpPayload) { ok -> connected = ok; latch.countDown() }
+            activeTunnels.add(tunnel)
+            try {
+                var connected = false
+                val latch = CountDownLatch(1)
+                tunnel.connect(dstHost, dstPort, tcpPayload) { ok -> connected = ok; latch.countDown() }
 
-            if (!latch.await(10, TimeUnit.SECONDS) || !connected) {
-                tunnel.close(); return
-            }
+                if (!latch.await(10, TimeUnit.SECONDS) || !connected) {
+                    tunnel.close(); return
+                }
 
-            val responseBytes = readTunnelResponse(tunnel, isDns)
-            // readTunnelResponse closes the tunnel in its finally block.
+                val responseBytes = readTunnelResponse(tunnel, isDns)
+                // readTunnelResponse closes the tunnel in its finally block.
 
-            if (responseBytes == null || responseBytes.isEmpty()) return
-            Log.d(TAG, "[$connId] UDP pkt ← $dstHost:$dstPort (${responseBytes.size}B)")
+                if (responseBytes == null || responseBytes.isEmpty()) return
+                Log.d(TAG, "[$connId] UDP pkt ← $dstHost:$dstPort (${responseBytes.size}B)")
 
             val addrBytes = try {
                 InetAddress.getByName(dstHost).address
@@ -293,7 +304,9 @@ class LocalSocks5Server(
             val udpReply = header + responseBytes
             val replyPkt = DatagramPacket(udpReply, udpReply.size, pkt.address, pkt.port)
             try { udpSock.send(replyPkt) } catch (_: Exception) {}
-
+            } finally {
+                activeTunnels.remove(tunnel)
+            }
         } catch (e: Exception) {
             Log.d(TAG, "[$connId] UDP relay error: ${e.message}")
         }

@@ -29,12 +29,13 @@
             </intent-filter>
         </activity>
 
-        <!-- ✅ VPN Service 声明 -->
+        <!-- ✅ VPN Service 声明 (独立进程，断开后可安全 kill 以重置原生库状态) -->
         <service
             android:name=".VlessVpnService"
             android:exported="false"
             android:foregroundServiceType="specialUse"
-            android:permission="android.permission.BIND_VPN_SERVICE">
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:process=":vpn">
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>

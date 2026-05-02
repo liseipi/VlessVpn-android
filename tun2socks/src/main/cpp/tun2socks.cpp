@@ -13,6 +13,10 @@ pthread_t thread_stdout;
 pthread_t thread_stderr;
 const char *ADBTAG = "tun2socks";
 
+// ★ 关键修复：管道和重定向线程只初始化一次，避免第二次 start 时
+//   dup2() 隐式关闭已被 fdsan 追踪的 fd，导致 SIGABRT 崩溃。
+static bool pipes_initialized = false;
+
 void *thread_stderr_func(void *) {
     ssize_t redirect_size;
     char buf[2048];
@@ -40,19 +44,22 @@ void *thread_stdout_func(void *) {
 }
 
 int start_redirecting_stdout_stderr() {
-    // Close old pipes if re-initializing, to avoid fd leak.
-    if (pipe_stdout[0] > 0) { close(pipe_stdout[0]); close(pipe_stdout[1]); }
-    if (pipe_stderr[0] > 0) { close(pipe_stderr[0]); close(pipe_stderr[1]); }
+    // ★ 已经初始化过则直接返回，不再重建管道和线程。
+    //   重复调用 dup2() 会让 fdsan 检测到对其追踪的 fd 的非法关闭，
+    //   触发 Fatal signal 6 (SIGABRT) 导致 App 在第二次 connect 时崩溃。
+    if (pipes_initialized) {
+        return 0;
+    }
 
     setvbuf(stdout, nullptr, _IONBF, 0);
     pipe(pipe_stdout);
     dup2(pipe_stdout[1], STDOUT_FILENO);
-    close(pipe_stdout[1]); // write end now owned by STDOUT_FILENO
+    close(pipe_stdout[1]); // write end 已被 dup2 接管，关闭原始 fd
 
     setvbuf(stderr, nullptr, _IONBF, 0);
     pipe(pipe_stderr);
     dup2(pipe_stderr[1], STDERR_FILENO);
-    close(pipe_stderr[1]); // write end now owned by STDERR_FILENO
+    close(pipe_stderr[1]); // write end 已被 dup2 接管，关闭原始 fd
 
     if (pthread_create(&thread_stdout, nullptr, thread_stdout_func, nullptr) == -1) {
         return -1;
@@ -64,6 +71,7 @@ int start_redirecting_stdout_stderr() {
     }
     pthread_detach(thread_stderr);
 
+    pipes_initialized = true;
     return 0;
 }
 
@@ -73,32 +81,28 @@ Java_com_musicses_vlessvpn_Tun2Socks_start_1tun2socks(JNIEnv *env, jclass clazz,
                                                       jobjectArray args) {
     jsize argument_count = env->GetArrayLength(args);
 
-    // 动态分配 argv 数组，避免 VLA
+    // 动态分配 argv 数组
     char **argv = (char **) calloc(argument_count + 1, sizeof(char *));
     if (argv == nullptr) {
         __android_log_write(ANDROID_LOG_ERROR, ADBTAG, "Failed to allocate argv");
         return -1;
     }
 
-    // 分配并复制每个参数
     for (jsize i = 0; i < argument_count; i++) {
         jstring jstr = (jstring) env->GetObjectArrayElement(args, i);
         const char *cstr = env->GetStringUTFChars(jstr, nullptr);
-        argv[i] = strdup(cstr);                    // 使用 strdup 复制字符串
+        argv[i] = strdup(cstr);
         env->ReleaseStringUTFChars(jstr, cstr);
     }
-    argv[argument_count] = nullptr;  // argv 必须以 nullptr 结尾
+    argv[argument_count] = nullptr;
 
-    // 重定向 stdout/stderr 到 logcat
     if (start_redirecting_stdout_stderr() == -1) {
         __android_log_write(ANDROID_LOG_ERROR, ADBTAG,
                             "Couldn't start redirecting stdout and stderr to logcat.");
     }
 
-    // 调用 tun2socks
-    int result = tun2socks_start((int)argument_count, argv);
+    int result = tun2socks_start((int) argument_count, argv);
 
-    // 清理内存
     for (jsize i = 0; i < argument_count; i++) {
         free(argv[i]);
     }

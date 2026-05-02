@@ -48,6 +48,7 @@ class VlessVpnService : VpnService() {
     // Atomic flags — safe to read without lock
     private val running = AtomicBoolean(false)
     private val userStopped = AtomicBoolean(false)
+    private val stopping = AtomicBoolean(false) // true while fullStop() is doing cleanup
 
     private val totalIn  = AtomicLong(0)
     private val totalOut = AtomicLong(0)
@@ -64,8 +65,17 @@ class VlessVpnService : VpnService() {
                 Log.i(TAG, "User requested STOP")
                 Thread({
                     fullStop()
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
+                    synchronized(lock) {
+                        // If user re-requested start while we were stopping, restart
+                        if (!userStopped.get()) {
+                            Log.i(TAG, "Start requested during stop, restarting")
+                            fullStart()
+                            return@Thread
+                        }
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                    }
+                    // Process kill is handled in onDestroy()
                 }, "VPN-Stop").start()
                 START_NOT_STICKY
             }
@@ -86,13 +96,27 @@ class VlessVpnService : VpnService() {
 
             ACTION_START -> {
                 userStopped.set(false)
-                if (running.get()) {
+                if (running.get() && !stopping.get()) {
                     Log.w(TAG, "Already running, ignoring START")
+                    return START_STICKY
+                }
+                if (stopping.get()) {
+                    Log.i(TAG, "Stop in progress, will auto-restart when done")
+                    startForeground(NOTIF_ID, buildNotif("Connecting…"),
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
                     return START_STICKY
                 }
                 startForeground(NOTIF_ID, buildNotif("Connecting…"),
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-                Thread({ fullStart() }, "VPN-Start").start()
+                Thread({
+                    synchronized(lock) {
+                        if (running.get() || stopping.get()) {
+                            Log.w(TAG, "fullStart: running or stopping, skipping")
+                            return@Thread
+                        }
+                        fullStart()
+                    }
+                }, "VPN-Start").start()
                 START_STICKY
             }
 
@@ -104,6 +128,17 @@ class VlessVpnService : VpnService() {
         Log.i(TAG, "onDestroy")
         if (running.get()) fullStop()
         super.onDestroy()
+        if (userStopped.get()) {
+            // This service runs in the :vpn process (see AndroidManifest.xml).
+            // Killing the process here forces a clean native-library reload on
+            // the next connect, working around a libtun2socks bug where TCP
+            // forwarding breaks after a terminate→start cycle.
+            Log.i(TAG, "User-initiated stop, killing VPN process")
+            Thread({
+                Thread.sleep(200)
+                android.os.Process.killProcess(android.os.Process.myPid())
+            }, "vpn-killer").start()
+        }
     }
 
     override fun onRevoke() {
@@ -212,6 +247,7 @@ class VlessVpnService : VpnService() {
             Log.w(TAG, "fullStop: not running")
             return
         }
+        stopping.set(true)
         Log.i(TAG, "===== fullStop =====")
 
         synchronized(lock) { statsThread?.interrupt(); statsThread = null }
@@ -221,6 +257,7 @@ class VlessVpnService : VpnService() {
         t2s?.join(3000)
 
         cleanup()
+        stopping.set(false)
         broadcast("DISCONNECTED")
         Log.i(TAG, "===== fullStop done =====")
     }
