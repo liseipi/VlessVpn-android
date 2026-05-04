@@ -30,14 +30,14 @@ class LocalSocks5Server(
     private lateinit var srv: ServerSocket
 
     private val connectionCount = AtomicInteger(0)
-    private val activeTunnels = ConcurrentHashMap.newKeySet<VlessTunnel>()
+    private val activeTunnels   = ConcurrentHashMap.newKeySet<VlessTunnel>()
 
     @Volatile var port: Int = 0; private set
     @Volatile private var running = false
 
     fun start(): Int {
-        srv = ServerSocket(0, 512, InetAddress.getByName("127.0.0.1"))
-        port = srv.localPort
+        srv     = ServerSocket(0, 512, InetAddress.getByName("127.0.0.1"))
+        port    = srv.localPort
         running = true
         pool.submit { acceptLoop() }
         Log.i(TAG, "SOCKS5 server started on 127.0.0.1:$port")
@@ -54,15 +54,17 @@ class LocalSocks5Server(
         pool.awaitTermination(3, TimeUnit.SECONDS)
     }
 
+    // ── Accept 循环 ───────────────────────────────────────────────────────────
+
     private fun acceptLoop() {
         while (running) {
             try {
                 val client = srv.accept()
-                val id = connectionCount.incrementAndGet()
+                val id     = connectionCount.incrementAndGet()
                 try {
                     pool.submit { handleClient(client, id) }
                 } catch (e: RejectedExecutionException) {
-                    Log.w(TAG, "[$id] Pool full, dropping connection: ${e.message}")
+                    Log.w(TAG, "[$id] Pool full, dropping connection")
                     runCatching { client.close() }
                 }
             } catch (e: Exception) {
@@ -72,9 +74,11 @@ class LocalSocks5Server(
         }
     }
 
+    // ── SOCKS5 握手 ───────────────────────────────────────────────────────────
+
     private fun handleClient(sock: Socket, connId: Int) {
         sock.tcpNoDelay = true
-        try { sock.sendBufferSize = 128 * 1024 } catch (_: Exception) {}
+        try { sock.sendBufferSize    = 128 * 1024 } catch (_: Exception) {}
         try { sock.receiveBufferSize = 128 * 1024 } catch (_: Exception) {}
         sock.soTimeout = 30_000
 
@@ -82,7 +86,7 @@ class LocalSocks5Server(
         val out = sock.getOutputStream()
 
         try {
-            // SOCKS5 握手
+            // 握手
             val greeting = inp.readNBytes(2)
             if (greeting.size < 2 || greeting[0] != 0x05.toByte()) {
                 Log.w(TAG, "[$connId] Invalid SOCKS5 greeting"); return
@@ -91,7 +95,7 @@ class LocalSocks5Server(
             if (nMethods > 0) inp.readNBytes(nMethods)
             out.write(byteArrayOf(0x05, 0x00)); out.flush()
 
-            // 读取命令
+            // 读命令
             val req = inp.readNBytes(4)
             if (req.size < 4 || req[0] != 0x05.toByte()) return
             val cmd = req[1].toInt() and 0xFF
@@ -119,52 +123,82 @@ class LocalSocks5Server(
         }
     }
 
-    // ── CONNECT ───────────────────────────────────────────────────────────────
+    // ── TCP CONNECT（核心路径：改用 connectAndRelay） ─────────────────────────
 
     private fun handleConnect(
-        sock: Socket, inp: InputStream, out: java.io.OutputStream,
-        connId: Int, destHost: String, destPort: Int
+        sock: Socket,
+        inp: InputStream,
+        out: java.io.OutputStream,
+        connId: Int,
+        destHost: String,
+        destPort: Int
     ) {
         Log.i(TAG, "[$connId] CONNECT $destHost:$destPort")
+
+        // 回复 SOCKS5 成功
         out.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0)); out.flush()
 
+        // 关闭握手超时，切换为长连接模式
         sock.soTimeout = 0
-        val earlyData = collectEarlyDataNonBlocking(inp)
+
+        // 收集 early data（对齐 VlessProxyClient.handleSocks5WithPeek()）
+        val earlyData = collectEarlyData(inp)
         if (earlyData != null) Log.d(TAG, "[$connId] earlyData: ${earlyData.size}B")
 
         val tunnel = VlessTunnel(cfg, vpnService)
         activeTunnels.add(tunnel)
+
+        // 包装流用于统计流量
+        val countingInp = object : InputStream() {
+            override fun read() = inp.read().also { if (it >= 0) onTransfer(0L, 1L) }
+            override fun read(b: ByteArray, off: Int, len: Int) =
+                inp.read(b, off, len).also { n -> if (n > 0) onTransfer(0L, n.toLong()) }
+            override fun available() = inp.available()
+            override fun close() = inp.close()
+        }
+        val countingOut = object : java.io.OutputStream() {
+            override fun write(b: Int) { out.write(b); onTransfer(1L, 0L) }
+            override fun write(b: ByteArray, off: Int, len: Int) {
+                out.write(b, off, len); onTransfer(len.toLong(), 0L)
+            }
+            override fun flush() = out.flush()
+            override fun close() = out.close()
+        }
+
+        // 把 socket 包装为带流量统计的虚拟 socket，供 VlessRelayFull 使用
+        val wrappedSock = WrappedSocket(sock, countingInp, countingOut)
+
         try {
-            var connected = false
-            val latch = CountDownLatch(1)
-            tunnel.connect(destHost, destPort, earlyData) { ok -> connected = ok; latch.countDown() }
+            val latch   = CountDownLatch(1)
+            var ok      = false
+
+            // ★ 使用新的 connectAndRelay：onOpen 即发头，WS listener 内置
+            tunnel.connectAndRelay(wrappedSock, destHost, destPort, earlyData) { connected ->
+                ok = connected
+                latch.countDown()
+            }
 
             if (!latch.await(30, TimeUnit.SECONDS)) {
-                Log.e(TAG, "[$connId] Tunnel timeout"); tunnel.close(); return
+                Log.e(TAG, "[$connId] Tunnel connect timeout")
+                tunnel.close()
+                return
             }
-            if (!connected) { Log.e(TAG, "[$connId] Tunnel failed"); tunnel.close(); return }
+            if (!ok) {
+                Log.e(TAG, "[$connId] Tunnel connect failed")
+                tunnel.close()
+                return
+            }
 
             Log.i(TAG, "[$connId] ✓ Tunnel ready, relaying $destHost:$destPort")
 
-            // ── 流量统计包装流（增量模式）────────────────────────────────────────
-            val countingIn = object : InputStream() {
-                override fun read() = inp.read().also { if (it >= 0) onTransfer(0L, 1L) }
-                override fun read(b: ByteArray, off: Int, len: Int) =
-                    inp.read(b, off, len).also { n -> if (n > 0) onTransfer(0L, n.toLong()) }
-                override fun available() = inp.available()
-                override fun close() = inp.close()
-            }
-
-            val countingOut = object : java.io.OutputStream() {
-                override fun write(b: Int) { out.write(b); onTransfer(1L, 0L) }
-                override fun write(b: ByteArray, off: Int, len: Int) {
-                    out.write(b, off, len); onTransfer(len.toLong(), 0L)
+            // connectAndRelay 已在内部启动双向中继（startSockToWs + onWsMessage 回调），
+            // 这里等待 socket 关闭即可（relay 线程结束时会 close socket）
+            try {
+                while (!sock.isClosed && sock.isConnected) {
+                    Thread.sleep(200)
                 }
-                override fun flush() = out.flush()
-                override fun close() = out.close()
-            }
+            } catch (_: InterruptedException) {}
 
-            tunnel.relay(countingIn, countingOut)
         } finally {
             activeTunnels.remove(tunnel)
         }
@@ -203,7 +237,8 @@ class LocalSocks5Server(
                     }
                 } catch (_: java.net.SocketTimeoutException) {
                 } catch (e: Exception) {
-                    if (running && !controlSock.isClosed) Log.d(TAG, "[$connId] UDP recv: ${e.message}")
+                    if (running && !controlSock.isClosed)
+                        Log.d(TAG, "[$connId] UDP recv: ${e.message}")
                     break
                 }
             }
@@ -231,26 +266,24 @@ class LocalSocks5Server(
         udpSock: DatagramSocket
     ) {
         if (rawData.size < 10) return
-
-        val frag = rawData[2].toInt() and 0xFF
-        if (frag != 0) return
+        if ((rawData[2].toInt() and 0xFF) != 0) return   // frag != 0，丢弃
 
         val atyp = rawData[3].toInt() and 0xFF
         val (dstHost, dstPort, dataOffset) = try {
             when (atyp) {
                 0x01 -> {
-                    val ip = InetAddress.getByAddress(rawData.copyOfRange(4, 8)).hostAddress!!
+                    val ip   = InetAddress.getByAddress(rawData.copyOfRange(4, 8)).hostAddress!!
                     val port = ((rawData[8].toInt() and 0xFF) shl 8) or (rawData[9].toInt() and 0xFF)
                     Triple(ip, port, 10)
                 }
                 0x03 -> {
-                    val len = rawData[4].toInt() and 0xFF
+                    val len  = rawData[4].toInt() and 0xFF
                     val host = String(rawData, 5, len)
                     val port = ((rawData[5 + len].toInt() and 0xFF) shl 8) or (rawData[6 + len].toInt() and 0xFF)
                     Triple(host, port, 7 + len)
                 }
                 0x04 -> {
-                    val ip = InetAddress.getByAddress(rawData.copyOfRange(4, 20)).hostAddress!!
+                    val ip   = InetAddress.getByAddress(rawData.copyOfRange(4, 20)).hostAddress!!
                     val port = ((rawData[20].toInt() and 0xFF) shl 8) or (rawData[21].toInt() and 0xFF)
                     Triple(ip, port, 22)
                 }
@@ -269,23 +302,22 @@ class LocalSocks5Server(
             payload
         }
 
+        val tunnel = VlessTunnel(cfg, vpnService)
+        activeTunnels.add(tunnel)
         try {
-            val tunnel = VlessTunnel(cfg, vpnService)
-            activeTunnels.add(tunnel)
-            try {
-                var connected = false
-                val latch = CountDownLatch(1)
-                tunnel.connect(dstHost, dstPort, tcpPayload) { ok -> connected = ok; latch.countDown() }
+            var connected = false
+            val latch     = CountDownLatch(1)
+            // UDP 路径使用 connect()（inQueue 模式）
+            tunnel.connect(dstHost, dstPort, tcpPayload) { ok -> connected = ok; latch.countDown() }
 
-                if (!latch.await(10, TimeUnit.SECONDS) || !connected) {
-                    tunnel.close(); return
-                }
+            if (!latch.await(10, TimeUnit.SECONDS) || !connected) {
+                tunnel.close(); return
+            }
 
-                val responseBytes = readTunnelResponse(tunnel, isDns)
-                // readTunnelResponse closes the tunnel in its finally block.
+            val responseBytes = readTunnelResponse(tunnel, isDns)
 
-                if (responseBytes == null || responseBytes.isEmpty()) return
-                Log.d(TAG, "[$connId] UDP pkt ← $dstHost:$dstPort (${responseBytes.size}B)")
+            if (responseBytes == null || responseBytes.isEmpty()) return
+            Log.d(TAG, "[$connId] UDP pkt ← $dstHost:$dstPort (${responseBytes.size}B)")
 
             val addrBytes = try {
                 InetAddress.getByName(dstHost).address
@@ -293,38 +325,28 @@ class LocalSocks5Server(
                 byteArrayOf(8, 8, 8, 8)
             }
             val replyAtyp: Byte = if (addrBytes.size == 4) 0x01 else 0x04
-            val header = byteArrayOf(
-                0x00, 0x00,
-                0x00,
-                replyAtyp
-            ) + addrBytes + byteArrayOf(
-                (dstPort shr 8).toByte(),
-                (dstPort and 0xFF).toByte()
-            )
-            val udpReply = header + responseBytes
-            val replyPkt = DatagramPacket(udpReply, udpReply.size, pkt.address, pkt.port)
+            val header    = byteArrayOf(0x00, 0x00, 0x00, replyAtyp) +
+                    addrBytes +
+                    byteArrayOf((dstPort shr 8).toByte(), (dstPort and 0xFF).toByte())
+            val udpReply  = header + responseBytes
+            val replyPkt  = DatagramPacket(udpReply, udpReply.size, pkt.address, pkt.port)
             try { udpSock.send(replyPkt) } catch (_: Exception) {}
-            } finally {
-                activeTunnels.remove(tunnel)
-            }
-        } catch (e: Exception) {
-            Log.d(TAG, "[$connId] UDP relay error: ${e.message}")
+
+        } finally {
+            activeTunnels.remove(tunnel)
         }
     }
 
     private fun readTunnelResponse(tunnel: VlessTunnel, isDns: Boolean): ByteArray? {
         val deadline = System.currentTimeMillis() + 5000
-        val baos = java.io.ByteArrayOutputStream()
-
+        val baos     = java.io.ByteArrayOutputStream()
         return try {
             if (isDns) {
                 val chunk = tunnel.inQueue.poll(5, TimeUnit.SECONDS) ?: return null
                 if (chunk === VlessTunnel.END_MARKER || chunk.size < 2) return null
-
                 val vlessHeaderLen = 2 + (chunk[1].toInt() and 0xFF)
                 val data = if (chunk.size > vlessHeaderLen)
                     chunk.copyOfRange(vlessHeaderLen, chunk.size) else return null
-
                 if (data.size < 2) return null
                 val msgLen = ((data[0].toInt() and 0xFF) shl 8) or (data[1].toInt() and 0xFF)
                 if (data.size >= 2 + msgLen) {
@@ -356,26 +378,55 @@ class LocalSocks5Server(
         }
     }
 
-    private fun collectEarlyDataNonBlocking(inp: InputStream): ByteArray? {
-        val avail = try { inp.available() } catch (_: Exception) { return null }
-        if (avail <= 0) return null
-        val buf = ByteArray(65536)
-        val baos = java.io.ByteArrayOutputStream()
-        try {
-            var remaining = avail
-            while (remaining > 0) {
-                val n = inp.read(buf, 0, minOf(remaining, buf.size))
-                if (n <= 0) break
-                baos.write(buf, 0, n); remaining -= n
-                val more = try { inp.available() } catch (_: Exception) { 0 }
-                if (more <= 0) break; remaining = more
-            }
-        } catch (_: Exception) {}
+    // ── 工具函数 ──────────────────────────────────────────────────────────────
+
+    /**
+     * 对齐 VlessProxyClient 的 early data 收集：
+     * 短暂 50ms 超时读一次，不阻塞后续流程
+     */
+    private fun collectEarlyData(inp: InputStream): ByteArray? {
+        // 先用 available() 无阻塞尝试
+        val avail = try { inp.available() } catch (_: Exception) { 0 }
+        val baos  = java.io.ByteArrayOutputStream()
+        if (avail > 0) {
+            val buf = ByteArray(65536)
+            try {
+                var rem = avail
+                while (rem > 0) {
+                    val n = inp.read(buf, 0, minOf(rem, buf.size))
+                    if (n <= 0) break
+                    baos.write(buf, 0, n)
+                    rem = try { inp.available() } catch (_: Exception) { 0 }
+                }
+            } catch (_: Exception) {}
+        }
         return if (baos.size() > 0) baos.toByteArray() else null
     }
 
     private fun readPort(inp: InputStream): Int {
         val b = inp.readNBytes(2)
         return ((b[0].toInt() and 0xFF) shl 8) or (b[1].toInt() and 0xFF)
+    }
+}
+
+// ── WrappedSocket：把统计流包装成 Socket，供 VlessRelayFull 使用 ───────────────
+
+/**
+ * VlessRelayFull 直接调用 sock.getInputStream() / sock.getOutputStream()，
+ * 所以需要把统计包装流注入进去。
+ */
+private class WrappedSocket(
+    private val delegate: Socket,
+    private val wrappedIn: InputStream,
+    private val wrappedOut: java.io.OutputStream
+) : Socket() {
+
+    override fun getInputStream():  InputStream              = wrappedIn
+    override fun getOutputStream(): java.io.OutputStream     = wrappedOut
+    override fun isClosed():        Boolean                  = delegate.isClosed
+    override fun isConnected():     Boolean                  = delegate.isConnected
+    override fun getPort():         Int                      = delegate.port
+    override fun close() {
+        runCatching { delegate.close() }
     }
 }
